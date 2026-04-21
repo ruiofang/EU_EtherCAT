@@ -1,0 +1,5 @@
+意优XML描述文件说明
+1，固件版本<=V143请使用：EYOU_ServoModule_ECAT_V143.xml;
+2，固件版本>=V145请使用：EYOU_ServoModule_ECAT_V145.xml;
+3，PH系列PDO需要按照16bit对齐配置，不然配置会报错；
+4，如果主站不识别槽功能，请使用：EYOU_ServoModule_ECAT_V14x_no_solt.xml；

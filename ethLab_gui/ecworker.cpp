@@ -1,0 +1,501 @@
+#include "ecworker.h"
+
+#include <QMutexLocker>
+#include <QDateTime>
+#include <unistd.h>
+#include <time.h>
+#include <cstring>
+#include <climits>
+#include <pthread.h>
+#include <sched.h>
+#include <sys/mman.h>
+
+/* ============ PDO 描述（与 main.cpp 示例保持一致） ============ */
+static ec_pdo_entry_info_t g_pdo_entries[] = {
+    /* RxPDO 0x1600 */
+    {0x6040, 0x00, 16},  // Control Word
+    {0x607A, 0x00, 32},  // Target Position
+    {0x60FF, 0x00, 32},  // Target Velocity
+    {0x6071, 0x00, 16},  // Target Torque
+    {0x6060, 0x00, 8},   // Mode of Operation
+    {0x60C2, 0x01, 8},   // 占位（16 字节对齐）
+
+    /* TxPDO 0x1A00 */
+    {0x6041, 0x00, 16},  // Status Word
+    {0x6064, 0x00, 32},  // Actual Position
+    {0x606C, 0x00, 32},  // Actual Velocity
+    {0x6077, 0x00, 16},  // Actual Torque
+    {0x6061, 0x00, 8},   // Mode of Operation Display
+    {0x603F, 0x00, 16},  // Error Code
+    {0x2026, 0x00, 8},   // 占位
+};
+
+static ec_pdo_info_t g_rx_pdo[] = {
+    {0x1600, 6, g_pdo_entries},
+};
+static ec_pdo_info_t g_tx_pdo[] = {
+    {0x1A00, 7, &g_pdo_entries[6]},
+};
+static ec_sync_info_t g_syncs[] = {
+    {0, EC_DIR_OUTPUT, 0, nullptr,  EC_WD_DISABLE},
+    {1, EC_DIR_INPUT,  0, nullptr,  EC_WD_DISABLE},
+    {2, EC_DIR_OUTPUT, 1, g_rx_pdo, EC_WD_ENABLE},
+    {3, EC_DIR_INPUT,  1, g_tx_pdo, EC_WD_DISABLE},
+    {0xff}
+};
+
+/* ================================================================ */
+EcWorker::EcWorker(QObject *parent) : QThread(parent) {}
+
+EcWorker::~EcWorker() {
+    requestStop();
+    wait();
+}
+
+void EcWorker::configure(const EcConfig &cfg) { cfg_ = cfg; }
+void EcWorker::requestStop()                  { running_ = false; }
+
+void EcWorker::setCommand(int slave, const MotorCommand &cmd) {
+    QMutexLocker lk(&mtx_);
+    if (slave >= 0 && slave < cmds_.size()) {
+        /* faultReset 是一次性脉冲 -> 若新请求为 true 则置位，否则保留旧值直至 worker 消费 */
+        bool keepReset = cmds_[slave].faultReset && !cmd.faultReset;
+        cmds_[slave] = cmd;
+        if (keepReset) cmds_[slave].faultReset = true;
+    }
+}
+
+QVector<MotorStatus> EcWorker::snapshot() {
+    QMutexLocker lk(&mtx_);
+    return status_;
+}
+
+void EcWorker::postSdo(const SdoJob &job) {
+    QMutexLocker lk(&sdoMtx_);
+    sdoQueue_.enqueue(job);
+    sdoCv_.wakeOne();
+}
+
+/* ================= SDO 子线程 ================= */
+class EcWorker::SdoThread : public QThread {
+public:
+    explicit SdoThread(EcWorker *w) : w_(w) {}
+protected:
+    void run() override {
+        while (w_->sdoRun_) {
+            SdoJob job;
+            {
+                QMutexLocker lk(&w_->sdoMtx_);
+                while (w_->sdoRun_ && w_->sdoQueue_.isEmpty())
+                    w_->sdoCv_.wait(&w_->sdoMtx_, 200);
+                if (!w_->sdoRun_) return;
+                if (w_->sdoQueue_.isEmpty()) continue;
+                job = w_->sdoQueue_.dequeue();
+            }
+            w_->doOneSdo(job);
+        }
+    }
+private:
+    EcWorker *w_;
+};
+
+/* ================================================================ */
+bool EcWorker::initMaster() {
+    const int N = cfg_.slaveCount;
+    cmds_.clear();   cmds_.resize(N);
+    status_.clear(); status_.resize(N);
+    enabled_.clear(); enabled_.resize(N);
+    startPos_.clear(); startPos_.resize(N);
+    curTp_.clear();  curTp_.resize(N);
+    lastSeq_.clear(); lastSeq_.resize(N);
+    ppPhase_.clear(); ppPhase_.resize(N);
+    sc_.resize(N);
+
+    off_cw_.resize(N);  off_tp_.resize(N);  off_tv_.resize(N);
+    off_tt_.resize(N);  off_om_.resize(N);  off_r1_.resize(N);
+    off_sw_.resize(N);  off_ap_.resize(N);  off_av_.resize(N);
+    off_at_.resize(N);  off_omd_.resize(N); off_err_.resize(N); off_r2_.resize(N);
+
+    master_ = ecrt_request_master(0);
+    if (!master_) { emit errorOccurred("ecrt_request_master(0) 失败"); return false; }
+
+    domain_ = ecrt_master_create_domain(master_);
+    if (!domain_) { emit errorOccurred("ecrt_master_create_domain 失败"); return false; }
+
+    for (int i = 0; i < N; ++i) {
+        sc_[i] = ecrt_master_slave_config(master_, 0, i, cfg_.vendor, cfg_.product);
+        if (!sc_[i]) { emit errorOccurred(QString("从站 %1 配置失败").arg(i)); return false; }
+        if (ecrt_slave_config_pdos(sc_[i], EC_END, g_syncs)) {
+            emit errorOccurred(QString("从站 %1 PDO 配置失败").arg(i));
+            return false;
+        }
+    }
+
+    /* 注册 PDO 条目 */
+    QVector<ec_pdo_entry_reg_t> regs;
+    regs.reserve(N * 13 + 1);
+    for (int i = 0; i < N; ++i) {
+        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x6040,0,&off_cw_[i],  nullptr});
+        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x607A,0,&off_tp_[i],  nullptr});
+        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x60FF,0,&off_tv_[i],  nullptr});
+        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x6071,0,&off_tt_[i],  nullptr});
+        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x6060,0,&off_om_[i],  nullptr});
+        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x60C2,1,&off_r1_[i],  nullptr});
+        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x6041,0,&off_sw_[i],  nullptr});
+        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x6064,0,&off_ap_[i],  nullptr});
+        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x606C,0,&off_av_[i],  nullptr});
+        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x6077,0,&off_at_[i],  nullptr});
+        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x6061,0,&off_omd_[i], nullptr});
+        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x603F,0,&off_err_[i], nullptr});
+        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x2026,0,&off_r2_[i],  nullptr});
+    }
+    regs.push_back({});
+    if (ecrt_domain_reg_pdo_entry_list(domain_, regs.data())) {
+        emit errorOccurred("ecrt_domain_reg_pdo_entry_list 失败");
+        return false;
+    }
+
+    if (ecrt_master_activate(master_)) {
+        emit errorOccurred("ecrt_master_activate 失败");
+        return false;
+    }
+    domain_pd_ = ecrt_domain_data(domain_);
+    if (!domain_pd_) { emit errorOccurred("domain data 未就绪"); return false; }
+
+    /* 等待所有从站进入 OP */
+    emit logMessage("等待从站进入 OP ...");
+    for (int tick = 0; tick < 5000 && running_; ++tick) {
+        ecrt_master_receive(master_);
+        ecrt_domain_process(domain_);
+        ecrt_domain_queue(domain_);
+        ecrt_master_send(master_);
+        if (tick % 100 == 0) {
+            int opCnt = 0;
+            ec_slave_config_state_t st{};
+            for (int i = 0; i < N; ++i) {
+                ecrt_slave_config_state(sc_[i], &st);
+                if (st.al_state == EC_AL_STATE_OP) ++opCnt;
+            }
+            if (opCnt == N) { emit logMessage("所有从站进入 OP"); return true; }
+        }
+        usleep(1000);
+    }
+    emit errorOccurred("超时：从站未全部进入 OP");
+    return false;
+}
+
+void EcWorker::cleanup() {
+    if (master_) {
+        ecrt_master_deactivate(master_);
+        ecrt_release_master(master_);
+        master_ = nullptr;
+    }
+    domain_ = nullptr;
+    domain_pd_ = nullptr;
+    sc_.clear();
+}
+
+/* ============== SDO 处理（在 SDO 子线程调用；阻塞安全） ============== */
+void EcWorker::doOneSdo(const SdoJob &job) {
+    SdoResult res; res.tag = job.tag;
+    if (!master_ || job.slave < 0 || job.slave >= cfg_.slaveCount) {
+        res.ok = false; res.err = "主站未启动或从站索引无效";
+        emit sdoFinished(res); return;
+    }
+    uint32_t abort = 0;
+    if (job.write) {
+        uint8_t buf[8] = {0};
+        size_t n = job.bits / 8;
+        int64_t v = job.value;
+        for (size_t k = 0; k < n; ++k) buf[k] = (v >> (8 * k)) & 0xFF;
+        int r = ecrt_master_sdo_download(master_, job.slave, job.index, job.subindex,
+                                         buf, n, &abort);
+        if (r) { res.ok = false; res.err = QString("SDO写失败 abort=0x%1").arg(abort, 0, 16); }
+        else   { res.ok = true; res.value = job.value; }
+    } else {
+        uint8_t buf[8] = {0};
+        size_t n = job.bits / 8;
+        size_t actual = 0;
+        int r = ecrt_master_sdo_upload(master_, job.slave, job.index, job.subindex,
+                                       buf, n, &actual, &abort);
+        if (r) { res.ok = false; res.err = QString("SDO读失败 abort=0x%1").arg(abort, 0, 16); }
+        else {
+            uint64_t u = 0;
+            for (size_t k = 0; k < actual; ++k) u |= ((uint64_t)buf[k]) << (8 * k);
+            if (job.isSigned) {
+                int bits = job.bits;
+                int64_t s = (int64_t)u;
+                if (bits < 64 && (u & (1ULL << (bits - 1))))
+                    s = (int64_t)(u | (~0ULL << bits));
+                res.value = s;
+            } else res.value = (int64_t)u;
+            res.ok = true;
+        }
+    }
+    emit sdoFinished(res);
+}
+
+/* ================= 主循环 ================= */
+void EcWorker::run() {
+    running_ = true;
+
+    /* --- 提高 RT 线程实时性 --- */
+    {
+        struct sched_param sp; sp.sched_priority = 80;
+        int rc = pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+        if (rc == 0) {
+            emit logMessage("RT 线程已设置 SCHED_FIFO priority=80");
+        } else {
+            emit logMessage(QString("<警告> SCHED_FIFO 设置失败(rc=%1)，请使用 sudo 运行，或检查 /etc/security/limits.conf 中 rtprio 限制").arg(rc));
+        }
+        if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+            emit logMessage("<警告> mlockall 失败，可能出现页错误导致抖动");
+        }
+    }
+
+    if (!initMaster()) { cleanup(); running_ = false; emit masterStopped(); return; }
+    emit masterStarted();
+
+    /* 启动 SDO 子线程 */
+    sdoRun_ = true;
+    sdoThread_ = new SdoThread(this);
+    sdoThread_->start();
+
+    const int periodUs = cfg_.cycleUs > 0 ? cfg_.cycleUs : 1000;
+    struct timespec wakeup; clock_gettime(CLOCK_MONOTONIC, &wakeup);
+
+    int diagTick = 0;
+    const int diagPeriod = 1000000 / periodUs;   // 每 1 秒诊断一次
+
+    /* 周期计时统计：实际周期 = 相邻两次唤醒后的时间差；
+       负载时间 = PDO收/算/发 所占用时间                  */
+    struct timespec tPrev{}; bool tPrevValid = false;
+    long sumDtNs = 0, maxDtNs = 0, minDtNs = LONG_MAX;
+    long sumLoadNs = 0, maxLoadNs = 0;
+    int  cycCnt = 0;
+    long overrunCnt = 0;
+    const long thresholdNs = (long)periodUs * 1000L * 3 / 2;  // 超过 1.5× 视为 overrun
+
+    while (running_) {
+        /* 等到下一个周期 */
+        wakeup.tv_nsec += (long)periodUs * 1000L;
+        while (wakeup.tv_nsec >= 1000000000L) { wakeup.tv_nsec -= 1000000000L; wakeup.tv_sec++; }
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &wakeup, nullptr);
+
+        /* --- 周期测量：唤醒时刻 --- */
+        struct timespec tWake; clock_gettime(CLOCK_MONOTONIC, &tWake);
+        if (tPrevValid) {
+            long dt = (tWake.tv_sec - tPrev.tv_sec) * 1000000000L
+                    + (tWake.tv_nsec - tPrev.tv_nsec);
+            sumDtNs += dt;
+            if (dt > maxDtNs) maxDtNs = dt;
+            if (dt < minDtNs) minDtNs = dt;
+            if (dt > thresholdNs) overrunCnt++;
+            cycCnt++;
+        }
+        tPrev = tWake; tPrevValid = true;
+
+        ecrt_master_receive(master_);
+        ecrt_domain_process(domain_);
+
+        /* 读快照 + 写入控制 */
+        QVector<MotorCommand> cmdLocal;
+        {
+            QMutexLocker lk(&mtx_);
+            cmdLocal = cmds_;
+        }
+
+        QVector<MotorStatus> stLocal(cfg_.slaveCount);
+        for (int i = 0; i < cfg_.slaveCount; ++i) {
+            uint16_t sw  = *(uint16_t*)(domain_pd_ + off_sw_[i]);
+            int32_t  ap  = *(int32_t*) (domain_pd_ + off_ap_[i]);
+            int32_t  av  = *(int32_t*) (domain_pd_ + off_av_[i]);
+            int16_t  at  = *(int16_t*) (domain_pd_ + off_at_[i]);
+            int8_t   omd = *(int8_t*)  (domain_pd_ + off_omd_[i]);
+            uint16_t er  = *(uint16_t*)(domain_pd_ + off_err_[i]);
+
+            ec_slave_config_state_t cs{};
+            ecrt_slave_config_state(sc_[i], &cs);
+
+            MotorStatus s;
+            s.statusWord=sw; s.actualPos=ap; s.actualVel=av;
+            s.actualTor=at; s.opModeDisp=omd; s.errorCode=er;
+            s.alState=cs.al_state; s.online=cs.online;
+            stLocal[i]=s;
+
+            /* ----- CiA402 状态机 ----- */
+            MotorCommand &c = cmdLocal[i];
+            *(int8_t*)(domain_pd_ + off_om_[i]) = c.opMode;
+
+            bool prevEnabled = enabled_[i];
+            uint16_t ctrl = 0x06;
+            if (sdoSafe_) {
+                /* 调参模式：全部电机下电，禁用脉冲与运动，仅维持通讯 */
+                ctrl = 0x06;
+                enabled_[i] = false;
+                ppPhase_[i] = 0;
+            } else if (c.faultReset) {
+                ctrl = 0x80;
+                /* 消费一次后清零 */
+                QMutexLocker lk(&mtx_);
+                if (i < cmds_.size()) cmds_[i].faultReset = false;
+            } else if (sw & (1 << 3)) {      // Fault
+                ctrl = 0x80;
+            } else if (!c.enable) {
+                ctrl = 0x06;                  // Shutdown
+                enabled_[i] = false;
+            } else {
+                switch (sw & 0x6F) {
+                    case 0x00: case 0x40: ctrl = 0x06; break;           // Not ready -> Shutdown
+                    case 0x21:            ctrl = 0x07; break;           // Ready -> SwitchOn
+                    case 0x23:            ctrl = 0x0F; break;           // SwitchedOn -> EnableOperation
+                    case 0x27:            ctrl = 0x0F; enabled_[i]=true; break; // Operation enabled
+                    default:              ctrl = 0x06; break;
+                }
+            }
+
+            /* 进入使能瞬间，捕获当前位置作为基准，避免 CSP 目标跳变 */
+            if (!prevEnabled && enabled_[i]) {
+                startPos_[i] = ap;
+                curTp_[i]    = ap;
+                lastSeq_[i]  = c.applySeq;   // 忽略使能前的残留 applySeq，避免误触发
+                ppPhase_[i]  = 0;
+                emit logMessage(QString("电机 %1 进入 OperationEnabled，起始位置=%2").arg(i).arg(ap));
+            }
+
+            /* 目标值 & 按模式定制 control word */
+            int32_t tp = ap;   // 默认跟随实际位置
+            if (c.opMode == MODE_CSP || c.opMode == MODE_IP) {
+                if (!enabled_[i]) {
+                    tp = ap;
+                    curTp_[i] = ap;
+                } else if (!c.absolute) {
+                    curTp_[i] += c.jogStep;
+                    tp = curTp_[i];
+                } else if (c.hasTarget) {
+                    int32_t goal = startPos_[i] + c.targetPos;
+                    int32_t step = c.jogStep > 0 ? c.jogStep : 500;
+                    int32_t diff = goal - curTp_[i];
+                    if (diff > step)       curTp_[i] += step;
+                    else if (diff < -step) curTp_[i] -= step;
+                    else                   curTp_[i]  = goal;
+                    tp = curTp_[i];
+                } else {
+                    tp = startPos_[i];
+                    curTp_[i] = startPos_[i];
+                }
+            } else if (!enabled_[i]) {
+                tp = ap;
+            } else {
+                /* PP/PV/HM/CST/CSV：直接下发用户目标 */
+                tp = c.targetPos;
+            }
+            *(int32_t*) (domain_pd_ + off_tp_[i]) = tp;
+            *(int32_t*) (domain_pd_ + off_tv_[i]) = c.targetVel;
+            *(int16_t*) (domain_pd_ + off_tt_[i]) = c.targetTor;
+
+            /* ===== PP / PV / HM：new_setpoint 脉冲握手 =====
+               - 用户每点"应用目标值" applySeq 会自增
+               - 收到新 seq 时进入 phase1：CW bit4=1 (new setpoint) + bit5=1 (change set immediately)
+                 （PP 还用 bit6 选 abs/rel：absolute=true -> bit6=0 绝对；false -> bit6=1 相对）
+               - 等待 SW bit12 (setpoint_ack) = 1 → phase2：CW bit4=0
+               - 等待 SW bit12 = 0 → 完成 phase0                                              */
+            if (enabled_[i] && (c.opMode == MODE_PP || c.opMode == MODE_PV || c.opMode == MODE_HM)) {
+                if (c.applySeq != lastSeq_[i]) {
+                    ppPhase_[i] = 1;
+                    lastSeq_[i] = c.applySeq;
+                    emit logMessage(QString("电机 %1 触发 new_setpoint (mode=%2, target=%3)")
+                        .arg(i).arg((int)c.opMode).arg(c.targetPos));
+                }
+                bool ack = (sw & (1 << 12)) != 0;
+                if (ppPhase_[i] == 1) {
+                    ctrl |= (1 << 4);           // new setpoint
+                    ctrl |= (1 << 5);           // change set immediately
+                    if (c.opMode == MODE_PP && !c.absolute) ctrl |= (1 << 6); // relative
+                    if (ack) ppPhase_[i] = 2;
+                } else if (ppPhase_[i] == 2) {
+                    /* bit4 清零等 ack 回落 */
+                    if (c.opMode == MODE_PP && !c.absolute) ctrl |= (1 << 6);
+                    if (!ack) ppPhase_[i] = 0;
+                }
+            } else {
+                ppPhase_[i] = 0;
+            }
+
+            /* IP 模式：使能后持续置 CW bit4 = 激活插补 (手册 4.4 CW=0x1F) */
+            if (enabled_[i] && c.opMode == MODE_IP) {
+                ctrl |= (1 << 4);
+            }
+
+            *(uint16_t*)(domain_pd_ + off_cw_[i]) = ctrl;
+        }
+
+        {
+            QMutexLocker lk(&mtx_);
+            status_ = stLocal;
+        }
+
+        ecrt_domain_queue(domain_);
+        ecrt_master_send(master_);
+
+        /* --- 本周期负载时间 --- */
+        struct timespec tEnd; clock_gettime(CLOCK_MONOTONIC, &tEnd);
+        {
+            long load = (tEnd.tv_sec - tWake.tv_sec) * 1000000000L
+                      + (tEnd.tv_nsec - tWake.tv_nsec);
+            sumLoadNs += load;
+            if (load > maxLoadNs) maxLoadNs = load;
+        }
+
+        /* 每秒诊断日志：CSP 模式下打印 实际/下发/终点，帮助排查不动的原因 */
+        if (++diagTick >= diagPeriod) {
+            diagTick = 0;
+
+            if (cycCnt > 0) {
+                double avgUs = (double)sumDtNs / cycCnt / 1000.0;
+                double minUs = (double)minDtNs / 1000.0;
+                double maxUs = (double)maxDtNs / 1000.0;
+                double jitterUs = maxUs - minUs;
+                double loadAvgUs = (double)sumLoadNs / cycCnt / 1000.0;
+                double loadMaxUs = (double)maxLoadNs / 1000.0;
+                emit logMessage(QString(
+                    "周期诊断 目标=%1us 实测 avg=%2us min=%3us max=%4us 抖动=%5us | 负载 avg=%6us max=%7us | overrun=%8/%9")
+                    .arg(periodUs)
+                    .arg(avgUs, 0, 'f', 2).arg(minUs, 0, 'f', 2)
+                    .arg(maxUs, 0, 'f', 2).arg(jitterUs, 0, 'f', 2)
+                    .arg(loadAvgUs, 0, 'f', 2).arg(loadMaxUs, 0, 'f', 2)
+                    .arg(overrunCnt).arg(cycCnt));
+            }
+            sumDtNs = 0; maxDtNs = 0; minDtNs = LONG_MAX;
+            sumLoadNs = 0; maxLoadNs = 0;
+            cycCnt = 0; overrunCnt = 0;
+
+            for (int i = 0; i < cfg_.slaveCount; ++i) {
+                if (!enabled_[i]) continue;
+                const MotorCommand &c = cmdLocal[i];
+                if (c.opMode != MODE_CSP || !c.hasTarget) continue;
+                int32_t ap   = *(int32_t*)(domain_pd_ + off_ap_[i]);
+                int32_t goal = startPos_[i] + c.targetPos;
+                emit logMessage(QString("CSP诊断 电机%1 SW=0x%2 AP=%3 curTP=%4 GOAL=%5 step=%6")
+                    .arg(i)
+                    .arg(*(uint16_t*)(domain_pd_ + off_sw_[i]), 4, 16, QChar('0'))
+                    .arg(ap).arg(curTp_[i]).arg(goal)
+                    .arg(c.jogStep > 0 ? c.jogStep : 500));
+            }
+        }
+    }
+
+    /* 停止 SDO 子线程 */
+    sdoRun_ = false;
+    { QMutexLocker lk(&sdoMtx_); sdoCv_.wakeAll(); }
+    if (sdoThread_) {
+        /* 必须无限等待：若 SDO 仍卡在 ecrt_master_sdo_* 的内核调用里，
+           我们宁愿多等几秒，也绝不能在 master 释放前让 SDO 线程悬挂 */
+        sdoThread_->wait();
+        delete sdoThread_;
+        sdoThread_ = nullptr;
+    }
+
+    cleanup();
+    emit masterStopped();
+}
