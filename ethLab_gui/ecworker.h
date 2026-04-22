@@ -34,6 +34,9 @@ struct MotorStatus {
     uint16_t errorCode  = 0;
     uint8_t  alState    = 0;
     bool     online     = false;
+    bool     isMotor    = false;   // 是否匹配 cfg.vendor/product 的电机从站
+    uint32_t vendorId   = 0;       // 总线读到的实际 vendor
+    uint32_t productCode= 0;       // 总线读到的实际 product
 };
 
 struct MotorCommand {
@@ -70,9 +73,12 @@ struct SdoResult {
 
 struct EcConfig {
     int      slaveCount = 2;
-    uint32_t vendor     = 0x00001097;
-    uint32_t product    = 0x00002406;
-    int      cycleUs    = 1000;   // 1ms
+    uint32_t vendor     = 0x00001097;   // 电机识别用 vendor
+    uint32_t product    = 0x00002406;   // 电机识别用 product
+    int      cycleUs    = 1000;         // 1ms
+    /* 可选：每个总线位置是否为电机的预设掩码（长度应等于 slaveCount）。
+       留空时 worker 会按实际总线扫描到的 vendor/product 自动判定。 */
+    QVector<bool> motorMask;
 };
 
 class EcWorker : public QThread {
@@ -134,6 +140,7 @@ private:
     QMutex mtx_;
     QVector<MotorCommand> cmds_;
     QVector<MotorStatus>  status_;
+    QVector<bool>         isMotor_;    // 与 slaveCount 等长；非电机位置跳过 PDO 控制
     QVector<bool>         enabled_;
     QVector<int32_t>      startPos_;   // 进入 OperationEnabled 瞬间的实际位置（做基准，避免跳变）
     QVector<int32_t>      curTp_;      // CSP 每周期实际下发的目标位置（用于梯形限速逼近 targetPos）

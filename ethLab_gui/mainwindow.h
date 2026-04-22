@@ -97,5 +97,6 @@ private:
 
     EcWorker            *worker_ = nullptr;
     QVector<MotorPanel>  panels_;
+    QVector<bool>        motorMask_;   // 扫描后每个总线位置是否为电机
     bool                 running_ = false;
 };

@@ -325,6 +325,17 @@ void MainWindow::rebuildMotorTabs(int n) {
 
         tabs_->addTab(scroll, QString("电机 %1").arg(i));
 
+        /* 若扫描结果表明该位置不是电机，则禁用所有控制并改标签 */
+        bool isMotor = (i < motorMask_.size()) ? motorMask_[i] : true;
+        if (!isMotor) {
+            tabs_->setTabText(tabs_->count() - 1, QString("从站 %1 (非电机)").arg(i));
+            /* 禁用全部控制按钮/SDO，避免误操作 */
+            for (QWidget *ww : {(QWidget*)gbCtl, (QWidget*)gbBrake, (QWidget*)gbSdo}) {
+                ww->setEnabled(false);
+            }
+            gbSt->setTitle(QString("从站 %1 (非电机设备)").arg(i));
+        }
+
         /* ---- 信号连接（用 lambda 捕获电机序号） ---- */
         connect(p.btnEnable,     &QPushButton::clicked, this, [this,i]{ onEnable(i); });
         connect(p.btnDisable,    &QPushButton::clicked, this, [this,i]{ onDisable(i); });
@@ -381,9 +392,11 @@ void MainWindow::onScan() {
 
     uint32_t firstVendor = 0, firstProduct = 0;
     bool allSame = (n > 0);
+    QVector<ec_slave_info_t> infos(n);
     for (int i = 0; i < n; ++i) {
-        ec_slave_info_t si;
+        ec_slave_info_t si{};
         if (ecrt_master_get_slave(m, (uint16_t)i, &si) == 0) {
+            infos[i] = si;
             appendLog(QString("  #%1  vendor=0x%2 product=0x%3 AL=0x%4 名称=\"%5\"")
                 .arg(i)
                 .arg(si.vendor_id, 8, 16, QChar('0'))
@@ -400,7 +413,29 @@ void MainWindow::onScan() {
     ecrt_release_master(m);
 
     if (n > 0) {
-        spSlaves_->setValue(n);         // 触发 rebuildMotorTabs
+        /* 选定用于电机识别的 vendor/product：若总线全为同一型号则直接采用；
+           否则保留用户原有 vendor/product，只根据匹配情况标记电机位置 */
+        uint32_t motorVendor  = firstVendor;
+        uint32_t motorProduct = firstProduct;
+        if (!allSame) {
+            bool ok1=false, ok2=false;
+            uint32_t v = edVendor_->text().toUInt(&ok1, 0);
+            uint32_t p = edProduct_->text().toUInt(&ok2, 0);
+            if (ok1 && ok2) { motorVendor = v; motorProduct = p; }
+        }
+        /* 根据选定 vendor/product 构建电机掩码 */
+        motorMask_.fill(false, n);
+        int motorCnt = 0;
+        for (int i = 0; i < n; ++i) {
+            if (infos[i].vendor_id == motorVendor && infos[i].product_code == motorProduct) {
+                motorMask_[i] = true; ++motorCnt;
+            }
+        }
+        appendLog(QString("识别到电机从站 %1 个 (vendor=0x%2 product=0x%3)")
+            .arg(motorCnt)
+            .arg(motorVendor, 8, 16, QChar('0'))
+            .arg(motorProduct, 8, 16, QChar('0')));
+
         if (allSame) {
             edVendor_->setText(QString("0x%1").arg(firstVendor, 8, 16, QChar('0')));
             edProduct_->setText(QString("0x%1").arg(firstProduct, 8, 16, QChar('0')));
@@ -408,9 +443,15 @@ void MainWindow::onScan() {
                 .arg(firstVendor, 8, 16, QChar('0'))
                 .arg(firstProduct, 8, 16, QChar('0')));
         } else {
-            appendLog("注意: 从站 vendor/product 不一致，请手动检查后再启动");
+            appendLog("总线存在混合设备；仅对匹配当前 Vendor/Product 的位置执行电机控制，其它位置将仅显示 AL 状态。");
         }
+
+        /* 如果 setValue 因为值未变化不会发出信号，这里显式刷新一次面板 */
+        const bool valueChanged = (spSlaves_->value() != n);
+        spSlaves_->setValue(n);
+        if (!valueChanged) rebuildMotorTabs(n);
     } else {
+        motorMask_.clear();
         appendLog("未发现从站。请检查网线连接、供电、以及主站绑定的网卡。");
     }
     btnScan_->setEnabled(true);
@@ -429,6 +470,8 @@ void MainWindow::onStart() {
     cfg.vendor     = vendor;
     cfg.product    = product;
     cfg.cycleUs    = spCycleUs_->value();
+    /* 若已扫描得到混合设备的电机掩码，长度吻合则传给 worker */
+    if (motorMask_.size() == cfg.slaveCount) cfg.motorMask = motorMask_;
 
     if (worker_) { worker_->requestStop(); worker_->wait(); delete worker_; worker_=nullptr; }
     worker_ = new EcWorker(this);
@@ -512,6 +555,17 @@ void MainWindow::onRefreshStatus() {
         const MotorStatus &s = snap[i];
         MotorPanel &p = panels_[i];
         p.lblAl->setText(QString("%1  %2").arg(alStateText(s.alState)).arg(s.online?"online":"offline"));
+        if (!s.isMotor) {
+            p.lblSw->setText(QString("非电机设备  vendor=0x%1 product=0x%2")
+                .arg(s.vendorId, 8, 16, QChar('0'))
+                .arg(s.productCode, 8, 16, QChar('0')));
+            p.lblPos->setText("-");
+            p.lblVel->setText("-");
+            p.lblTor->setText("-");
+            p.lblErr->setText("-");
+            p.lblModeDisp->setText("-");
+            continue;
+        }
         p.lblSw->setText(QString("0x%1  (%2)").arg(s.statusWord,4,16,QChar('0')).arg(swText(s.statusWord)));
         p.lblPos->setText(QString::number(s.actualPos));
         p.lblVel->setText(QString::number(s.actualVel));

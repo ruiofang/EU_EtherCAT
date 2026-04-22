@@ -104,17 +104,18 @@ bool EcWorker::initMaster() {
     const int N = cfg_.slaveCount;
     cmds_.clear();   cmds_.resize(N);
     status_.clear(); status_.resize(N);
+    isMotor_.clear(); isMotor_.resize(N);
     enabled_.clear(); enabled_.resize(N);
     startPos_.clear(); startPos_.resize(N);
     curTp_.clear();  curTp_.resize(N);
     lastSeq_.clear(); lastSeq_.resize(N);
     ppPhase_.clear(); ppPhase_.resize(N);
-    sc_.resize(N);
+    sc_.clear(); sc_.resize(N);   // 默认 nullptr
 
-    off_cw_.resize(N);  off_tp_.resize(N);  off_tv_.resize(N);
-    off_tt_.resize(N);  off_om_.resize(N);  off_r1_.resize(N);
-    off_sw_.resize(N);  off_ap_.resize(N);  off_av_.resize(N);
-    off_at_.resize(N);  off_omd_.resize(N); off_err_.resize(N); off_r2_.resize(N);
+    off_cw_.fill(0, N);  off_tp_.fill(0, N);  off_tv_.fill(0, N);
+    off_tt_.fill(0, N);  off_om_.fill(0, N);  off_r1_.fill(0, N);
+    off_sw_.fill(0, N);  off_ap_.fill(0, N);  off_av_.fill(0, N);
+    off_at_.fill(0, N);  off_omd_.fill(0, N); off_err_.fill(0, N); off_r2_.fill(0, N);
 
     master_ = ecrt_request_master(0);
     if (!master_) { emit errorOccurred("ecrt_request_master(0) 失败"); return false; }
@@ -122,32 +123,101 @@ bool EcWorker::initMaster() {
     domain_ = ecrt_master_create_domain(master_);
     if (!domain_) { emit errorOccurred("ecrt_master_create_domain 失败"); return false; }
 
+    /* ===== 先扫描总线，按 vendor/product 区分电机与非电机设备 ===== */
+    ec_master_info_t mi{};
+    if (ecrt_master(master_, &mi) != 0) {
+        emit errorOccurred("ecrt_master(info) 失败");
+        return false;
+    }
+    if ((int)mi.slave_count < N) {
+        emit logMessage(QString("<警告> 配置的从站数=%1，但总线仅检测到 %2 个从站；"
+                                "超出范围的位置将被跳过").arg(N).arg(mi.slave_count));
+    }
+
+    const bool useMaskHint = (cfg_.motorMask.size() == N);
+    QString motorList, otherList;
     for (int i = 0; i < N; ++i) {
-        sc_[i] = ecrt_master_slave_config(master_, 0, i, cfg_.vendor, cfg_.product);
-        if (!sc_[i]) { emit errorOccurred(QString("从站 %1 配置失败").arg(i)); return false; }
-        if (ecrt_slave_config_pdos(sc_[i], EC_END, g_syncs)) {
-            emit errorOccurred(QString("从站 %1 PDO 配置失败").arg(i));
-            return false;
+        MotorStatus &s = status_[i];
+        s.isMotor = false;
+        if (i >= (int)mi.slave_count) {
+            isMotor_[i] = false;
+            continue;   // 该位置总线上不存在
+        }
+        ec_slave_info_t si{};
+        if (ecrt_master_get_slave(master_, (uint16_t)i, &si) != 0) {
+            emit logMessage(QString("从站 %1 信息读取失败，跳过").arg(i));
+            isMotor_[i] = false;
+            continue;
+        }
+        s.vendorId    = si.vendor_id;
+        s.productCode = si.product_code;
+
+        bool isMotor;
+        if (useMaskHint) {
+            isMotor = cfg_.motorMask[i];
+        } else {
+            isMotor = (si.vendor_id == cfg_.vendor && si.product_code == cfg_.product);
+        }
+        isMotor_[i] = isMotor;
+        s.isMotor   = isMotor;
+
+        if (isMotor) {
+            /* 仅为电机从站创建 slave_config 并下发 PDO，非电机从站不做任何配置，
+               IgH 就不会试图把它拉到 OP，从而不会阻塞电机 activate 过程 */
+            sc_[i] = ecrt_master_slave_config(master_, 0, i, si.vendor_id, si.product_code);
+            if (!sc_[i]) {
+                emit errorOccurred(QString("从站 %1 配置失败 (vendor=0x%2 product=0x%3)")
+                    .arg(i)
+                    .arg(si.vendor_id, 8, 16, QChar('0'))
+                    .arg(si.product_code, 8, 16, QChar('0')));
+                return false;
+            }
+            if (ecrt_slave_config_pdos(sc_[i], EC_END, g_syncs)) {
+                emit errorOccurred(QString("从站 %1 PDO 配置失败").arg(i));
+                return false;
+            }
+            motorList += QString(" #%1").arg(i);
+        } else {
+            sc_[i] = nullptr;
+            otherList += QString(" #%1(0x%2/0x%3 %4)")
+                .arg(i)
+                .arg(si.vendor_id, 0, 16)
+                .arg(si.product_code, 0, 16)
+                .arg(QString::fromUtf8(si.name));
         }
     }
 
-    /* 注册 PDO 条目 */
+    int motorCount = 0;
+    for (int i = 0; i < N; ++i) if (isMotor_[i]) ++motorCount;
+    emit logMessage(QString("识别电机从站 %1 个:%2")
+        .arg(motorCount).arg(motorList.isEmpty() ? " (无)" : motorList));
+    if (!otherList.isEmpty())
+        emit logMessage(QString("其他非电机设备:%1").arg(otherList));
+    if (motorCount == 0) {
+        emit errorOccurred("未识别到任何电机从站，请检查 Vendor/Product 是否与总线匹配");
+        return false;
+    }
+
+    /* 仅为电机从站注册 PDO 条目 */
     QVector<ec_pdo_entry_reg_t> regs;
-    regs.reserve(N * 13 + 1);
+    regs.reserve(motorCount * 13 + 1);
     for (int i = 0; i < N; ++i) {
-        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x6040,0,&off_cw_[i],  nullptr});
-        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x607A,0,&off_tp_[i],  nullptr});
-        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x60FF,0,&off_tv_[i],  nullptr});
-        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x6071,0,&off_tt_[i],  nullptr});
-        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x6060,0,&off_om_[i],  nullptr});
-        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x60C2,1,&off_r1_[i],  nullptr});
-        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x6041,0,&off_sw_[i],  nullptr});
-        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x6064,0,&off_ap_[i],  nullptr});
-        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x606C,0,&off_av_[i],  nullptr});
-        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x6077,0,&off_at_[i],  nullptr});
-        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x6061,0,&off_omd_[i], nullptr});
-        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x603F,0,&off_err_[i], nullptr});
-        regs.push_back({0,i,cfg_.vendor,cfg_.product,0x2026,0,&off_r2_[i],  nullptr});
+        if (!isMotor_[i]) continue;
+        uint32_t vid = status_[i].vendorId;
+        uint32_t pid = status_[i].productCode;
+        regs.push_back({0,(uint16_t)i,vid,pid,0x6040,0,&off_cw_[i],  nullptr});
+        regs.push_back({0,(uint16_t)i,vid,pid,0x607A,0,&off_tp_[i],  nullptr});
+        regs.push_back({0,(uint16_t)i,vid,pid,0x60FF,0,&off_tv_[i],  nullptr});
+        regs.push_back({0,(uint16_t)i,vid,pid,0x6071,0,&off_tt_[i],  nullptr});
+        regs.push_back({0,(uint16_t)i,vid,pid,0x6060,0,&off_om_[i],  nullptr});
+        regs.push_back({0,(uint16_t)i,vid,pid,0x60C2,1,&off_r1_[i],  nullptr});
+        regs.push_back({0,(uint16_t)i,vid,pid,0x6041,0,&off_sw_[i],  nullptr});
+        regs.push_back({0,(uint16_t)i,vid,pid,0x6064,0,&off_ap_[i],  nullptr});
+        regs.push_back({0,(uint16_t)i,vid,pid,0x606C,0,&off_av_[i],  nullptr});
+        regs.push_back({0,(uint16_t)i,vid,pid,0x6077,0,&off_at_[i],  nullptr});
+        regs.push_back({0,(uint16_t)i,vid,pid,0x6061,0,&off_omd_[i], nullptr});
+        regs.push_back({0,(uint16_t)i,vid,pid,0x603F,0,&off_err_[i], nullptr});
+        regs.push_back({0,(uint16_t)i,vid,pid,0x2026,0,&off_r2_[i],  nullptr});
     }
     regs.push_back({});
     if (ecrt_domain_reg_pdo_entry_list(domain_, regs.data())) {
@@ -162,25 +232,52 @@ bool EcWorker::initMaster() {
     domain_pd_ = ecrt_domain_data(domain_);
     if (!domain_pd_) { emit errorOccurred("domain data 未就绪"); return false; }
 
-    /* 等待所有从站进入 OP */
-    emit logMessage("等待从站进入 OP ...");
-    for (int tick = 0; tick < 5000 && running_; ++tick) {
+    /* 等待所有电机从站进入 OP（非电机位置未配置，不会被 IgH 尝试带到 OP，不阻塞本流程） */
+    emit logMessage("等待电机从站进入 OP ...");
+    const int maxTicks = 10000;   // 最多等 10s
+    int lastLogTick = -1;
+    for (int tick = 0; tick < maxTicks && running_; ++tick) {
         ecrt_master_receive(master_);
         ecrt_domain_process(domain_);
         ecrt_domain_queue(domain_);
         ecrt_master_send(master_);
-        if (tick % 100 == 0) {
+        if (tick % 500 == 499 || tick == 0) {
+            QString prog;
             int opCnt = 0;
             ec_slave_config_state_t st{};
             for (int i = 0; i < N; ++i) {
+                if (!isMotor_[i] || !sc_[i]) continue;
                 ecrt_slave_config_state(sc_[i], &st);
+                prog += QString(" #%1=AL0x%2/%3")
+                    .arg(i).arg(st.al_state, 2, 16, QChar('0'))
+                    .arg(st.online ? "on" : "off");
                 if (st.al_state == EC_AL_STATE_OP) ++opCnt;
             }
-            if (opCnt == N) { emit logMessage("所有从站进入 OP"); return true; }
+            if (tick != lastLogTick) {
+                emit logMessage(QString("电机进度 t=%1ms 已OP=%2/%3 |%4")
+                    .arg(tick).arg(opCnt).arg(motorCount).arg(prog));
+                lastLogTick = tick;
+            }
+            if (opCnt == motorCount) {
+                emit logMessage(QString("全部 %1 个电机从站进入 OP").arg(motorCount));
+                return true;
+            }
         }
         usleep(1000);
     }
-    emit errorOccurred("超时：从站未全部进入 OP");
+    /* 超时，打印最终状态 */
+    {
+        QString prog;
+        ec_slave_config_state_t st{};
+        for (int i = 0; i < N; ++i) {
+            if (!isMotor_[i] || !sc_[i]) continue;
+            ecrt_slave_config_state(sc_[i], &st);
+            prog += QString(" #%1 AL=0x%2 online=%3 operational=%4")
+                .arg(i).arg(st.al_state, 2, 16, QChar('0'))
+                .arg(st.online).arg(st.operational);
+        }
+        emit errorOccurred(QString("超时：电机从站未全部进入 OP；%1").arg(prog));
+    }
     return false;
 }
 
@@ -307,6 +404,22 @@ void EcWorker::run() {
 
         QVector<MotorStatus> stLocal(cfg_.slaveCount);
         for (int i = 0; i < cfg_.slaveCount; ++i) {
+            /* 非电机位置：仅刷新 AL/在线信息，不读写 PDO、不运行状态机 */
+            if (!isMotor_[i]) {
+                MotorStatus s;
+                s.isMotor     = false;
+                s.vendorId    = status_[i].vendorId;
+                s.productCode = status_[i].productCode;
+                /* 非电机未通过 ecrt_master_slave_config 注册，只能通过 master 查询实时 info */
+                ec_slave_info_t si{};
+                if (ecrt_master_get_slave(master_, (uint16_t)i, &si) == 0) {
+                    s.alState = si.al_state;
+                    s.online  = (si.al_state != 0);
+                }
+                stLocal[i] = s;
+                continue;
+            }
+
             uint16_t sw  = *(uint16_t*)(domain_pd_ + off_sw_[i]);
             int32_t  ap  = *(int32_t*) (domain_pd_ + off_ap_[i]);
             int32_t  av  = *(int32_t*) (domain_pd_ + off_av_[i]);
@@ -321,6 +434,9 @@ void EcWorker::run() {
             s.statusWord=sw; s.actualPos=ap; s.actualVel=av;
             s.actualTor=at; s.opModeDisp=omd; s.errorCode=er;
             s.alState=cs.al_state; s.online=cs.online;
+            s.isMotor = true;
+            s.vendorId    = status_[i].vendorId;
+            s.productCode = status_[i].productCode;
             stLocal[i]=s;
 
             /* ----- CiA402 状态机 ----- */
