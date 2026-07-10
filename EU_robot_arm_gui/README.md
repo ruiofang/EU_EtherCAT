@@ -14,6 +14,7 @@
   - SDO：任意索引/子索引，8/16/32 位，有/无符号的读写
 - 实时线程 1ms 周期（`clock_nanosleep` 绝对时间），GUI 与 RT 线程通过互斥锁交换状态/命令
 - CiA402 状态机自动推进（`0x06 → 0x07 → 0x0F`，Fault → 0x80 复位）
+- 退出安全停机：关闭 GUI、停止主站或 CLI 退出时，先对全部电机发送 CiA402 `Quick Stop`（`Controlword=0x0002`），将位置目标锁定到当前反馈并将速度、力矩目标清零；速度归零后再释放主站（异常时最多等待 1 秒）
 
 ## 依赖
 
@@ -28,7 +29,7 @@ sudo apt install qtbase5-dev cmake build-essential
 ## 编译
 
 ```bash
-cd ethLab_gui
+cd EU_robot_arm_gui
 mkdir -p build && cd build
 cmake ..
 make -j
@@ -39,7 +40,7 @@ make -j
 需要 root 权限（访问 EtherCAT 字符设备）：
 
 ```bash
-sudo ./ethLab_gui
+sudo ./EU_robot_arm_gui
 ```
 
 > 建议：赋予 `cap_sys_nice` / `cap_ipc_lock` 以获得更稳定的实时性，或使用 PREEMPT_RT 内核。
@@ -121,6 +122,13 @@ CLI 默认不输出周期诊断等普通 EtherCAT 日志，只显示错误、SDO
 5. 在电机 Tab 选择模式 → 点 **使能** → 填目标值 → **应用**
 6. 使用 SDO 区读写 0x6083（加速度）/ 0x6084（减速度）/ 0x6081（轮廓速度）/ 0x607D（软限位）等调试参数
 
+## 停止与退出
+
+- 点击“停止主站”、关闭 GUI 窗口、收到 `SIGINT`/`SIGTERM`，以及 CLI 选择 `0. 退出`，都会进入相同的受控停机流程。
+- 实时线程会连续发送至少 3 个 EtherCAT 周期的 `Quick Stop`，立即中止正在执行的回起点或轨迹播放，并锁定当前反馈位置，防止继续沿旧目标运动。
+- 当全部已识别电机的实际速度接近零后，程序才释放 EtherCAT Master；若驱动未在 1 秒内反馈停止，程序仍会继续退出，避免界面或 CLI 无限等待。
+- `Quick Stop` 的减速度和断开通讯后的保持策略由驱动器参数决定。真实机械臂必须保留独立硬件急停和抱闸等安全回路，不能将软件退出流程作为安全功能的替代。
+
 ## 默认 Vendor/Product
 
 ```
@@ -133,7 +141,7 @@ PRODUCT_CODE = 0x00002406
 ## 文件结构
 
 ```
-ethLab_gui/
+EU_robot_arm_gui/
   CMakeLists.txt     构建
   main.cpp           入口
   mainwindow.{h,cpp} Qt GUI

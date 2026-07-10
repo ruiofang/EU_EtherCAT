@@ -54,7 +54,7 @@ EcWorker::~EcWorker() {
 }
 
 void EcWorker::configure(const EcConfig &cfg) { cfg_ = cfg; }
-void EcWorker::requestStop()                  { running_ = false; }
+void EcWorker::requestStop()                  { stopRequested_ = true; }
 
 void EcWorker::setCommand(int slave, const MotorCommand &cmd) {
     QMutexLocker lk(&mtx_);
@@ -104,14 +104,17 @@ void EcWorker::endMotionRecord() {
     emit motionRecordFinished(out);
 }
 
-bool EcWorker::beginMotionReturnToStart(const RecordedMotion &motion, int returnSpeed) {
+bool EcWorker::beginMotionReturnToStart(const RecordedMotion &motion, int returnSpeed, bool keepEnabled) {
     if (!running_ || motion.frames.size() < 2 || motion.sampleMs < 1 || returnSpeed <= 0)
         return false;
     for (const auto &f : motion.frames) if (f.size() != cfg_.slaveCount) return false;
     {
         QMutexLocker ml(&motionMtx_);
         if (motionMode_ != MotionIdle) return false;
-        { QMutexLocker lk(&mtx_); for (MotorCommand &c : cmds_) c.enable = false; }
+        if (!keepEnabled) {
+            QMutexLocker lk(&mtx_);
+            for (MotorCommand &c : cmds_) c.enable = false;
+        }
         playback_ = motion;
         returnSpeed_ = returnSpeed;
         motionTarget_.clear();
@@ -454,6 +457,7 @@ void EcWorker::run() {
     int  cycCnt = 0;
     long overrunCnt = 0;
     const long thresholdNs = (long)periodUs * 1000L * 3 / 2;  // 超过 1.5× 视为 overrun
+    int stopCycles = 0;
 
     while (running_) {
         /* 等到下一个周期 */
@@ -489,6 +493,7 @@ void EcWorker::run() {
             QMutexLocker ml(&motionMtx_);
             activeMotion = motionMode_;
         }
+        const bool stopping = stopRequested_;
         if ((activeMotion == MotionReturning || activeMotion == MotionReady || activeMotion == MotionPlaying)
                 && motionTarget_.size() != cfg_.slaveCount) {
             motionTarget_.fill(0, cfg_.slaveCount);
@@ -535,6 +540,18 @@ void EcWorker::run() {
 
             /* ----- CiA402 状态机 ----- */
             MotorCommand &c = cmdLocal[i];
+            if (stopping) {
+                /* 退出时不可直接撤掉 PDO：先用 Quick Stop 让驱动受控减速，
+                   并将所有目标锁定为当前反馈，避免继续执行未完成的轨迹。 */
+                *(int8_t*)  (domain_pd_ + off_om_[i]) = MODE_CSP;
+                *(int32_t*) (domain_pd_ + off_tp_[i]) = ap;
+                *(int32_t*) (domain_pd_ + off_tv_[i]) = 0;
+                *(int16_t*) (domain_pd_ + off_tt_[i]) = 0;
+                *(uint16_t*)(domain_pd_ + off_cw_[i]) = 0x02;
+                enabled_[i] = false;
+                ppPhase_[i] = 0;
+                continue;
+            }
             if (activeMotion == MotionRecording) {
                 c.enable = false;
             } else if (activeMotion == MotionReturning || activeMotion == MotionReady || activeMotion == MotionPlaying) {
@@ -733,6 +750,21 @@ void EcWorker::run() {
 
         ecrt_domain_queue(domain_);
         ecrt_master_send(master_);
+
+        if (stopping) {
+            bool allStopped = true;
+            for (int i = 0; i < cfg_.slaveCount; ++i) {
+                if (isMotor_[i] && qAbs((int)stLocal[i].actualVel) > 10) {
+                    allStopped = false;
+                    break;
+                }
+            }
+            if (++stopCycles == 1)
+                emit logMessage("退出请求：已下发所有电机 Quick Stop，等待速度归零");
+            /* 至少发送 3 个周期；异常时最多等待 1 秒，避免退出无限阻塞。 */
+            if (stopCycles >= 3 && (allStopped || stopCycles >= 1000000 / periodUs))
+                running_ = false;
+        }
 
         /* --- 本周期负载时间 --- */
         struct timespec tEnd; clock_gettime(CLOCK_MONOTONIC, &tEnd);

@@ -106,7 +106,8 @@ public:
     void postSdo(const SdoJob &job);
     bool beginMotionRecord(int sampleMs);
     void endMotionRecord();
-    bool beginMotionReturnToStart(const RecordedMotion &motion, int returnSpeed);
+    bool beginMotionReturnToStart(const RecordedMotion &motion, int returnSpeed,
+                                  bool keepEnabled = false);
     bool startPreparedMotionPlayback();
     void stopMotionActivity();
 
@@ -138,6 +139,7 @@ private:
 
     EcConfig cfg_;
     std::atomic<bool> running_{false};
+    std::atomic<bool> stopRequested_{false};
     std::atomic<bool> sdoSafe_{false};
 
     ec_master_t *master_ = nullptr;

@@ -33,7 +33,7 @@ public:
         connect(&worker_, &EcWorker::motionStateChanged, this, [this](const QString &s) {
             motionState_ = s; out("[动作] " + s);
             if (s == "已到起点" && autoPlay_) { autoPlay_ = false; worker_.startPreparedMotionPlayback(); }
-            if (s == "播放完成") QTimer::singleShot(100, this, [this] { writeBrakes(false); });
+            if (s == "播放完成") out("播放完成：保持使能，不自动抱闸");
         });
         connect(&worker_, &EcWorker::motionRecordFinished, this, [this](const RecordedMotion &m) { saveRecorded(m); });
         connect(&worker_, &EcWorker::sdoFinished, this, [this](const SdoResult &r) {
@@ -183,10 +183,36 @@ private:
     void returnMotion(const QString &name, int speed, bool autoPlay) {
         const CliMotion *m = findMotion(name);
         if (!m) { out("动作不存在：" + name); return; }
-        autoPlay_ = autoPlay; setEnableAll(false); writeBrakes(true);
+        const auto states = worker_.snapshot();
+        bool anyMotor = false;
+        bool allMotorEnabled = true;
+        for (const MotorStatus &state : states) {
+            if (!state.isMotor) continue;
+            anyMotor = true;
+            if ((state.statusWord & 0x6F) != 0x27) {
+                allMotorEnabled = false;
+                break;
+            }
+        }
+
+        autoPlay_ = autoPlay;
         RecordedMotion motion = m->data;
+        if (anyMotor && allMotorEnabled) {
+            out("回起点：电机已使能，跳过失能和抱闸操作");
+            if (!worker_.beginMotionReturnToStart(motion, speed, true)) {
+                autoPlay_ = false;
+                out("无法启动回起点任务");
+            }
+            return;
+        }
+
+        setEnableAll(false);
+        writeBrakes(true);
         QTimer::singleShot(150, this, [this, motion, speed] {
-            if (!worker_.beginMotionReturnToStart(motion, speed)) out("无法启动回起点任务");
+            if (!worker_.beginMotionReturnToStart(motion, speed)) {
+                autoPlay_ = false;
+                out("无法启动回起点任务");
+            }
         });
     }
 

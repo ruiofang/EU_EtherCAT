@@ -777,7 +777,7 @@ void MainWindow::onReturnMotion() {
     }
     if (anyMotor && allMotorEnabled) {
         playbackPreparing_ = false;
-        if (!worker_->beginMotionReturnToStart(pendingPlaybackMotion_, pendingPlaybackSpeed_)) {
+        if (!worker_->beginMotionReturnToStart(pendingPlaybackMotion_, pendingPlaybackSpeed_, true)) {
             tabs_->setEnabled(true); btnRecord_->setEnabled(true); btnPlay_->setEnabled(true);
             btnReturn_->setEnabled(true); btnReturnPlay_->setEnabled(true);
             btnEnableAll_->setEnabled(true); btnFaultResetAll_->setEnabled(true); btnDisableRelease_->setEnabled(true);
