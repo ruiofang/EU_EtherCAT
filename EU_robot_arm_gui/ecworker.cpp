@@ -714,7 +714,18 @@ void EcWorker::run() {
                 QMutexLocker ml(&motionMtx_);
                 if (motionMode_ == MotionPlaying) {
                     motionMode_ = MotionIdle;
-                    { QMutexLocker lk(&mtx_); for (MotorCommand &c : cmds_) c.enable = false; }
+                    {
+                        QMutexLocker lk(&mtx_);
+                        for (int i = 0; i < cmds_.size(); ++i) {
+                            if (!isMotor_[i]) continue;
+                            const int32_t finalPosition = playback_.frames.last()[i];
+                            startPos_[i] = finalPosition;
+                            curTp_[i] = finalPosition;
+                            cmds_[i].opMode = MODE_CSP;
+                            cmds_[i].enable = true;
+                            cmds_[i].hasTarget = false;
+                        }
+                    }
                     emit motionStateChanged("播放完成");
                 }
             } else ++playTick_;

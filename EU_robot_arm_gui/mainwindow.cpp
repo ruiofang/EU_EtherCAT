@@ -751,7 +751,8 @@ void MainWindow::onReturnMotion() {
     if (row < 0 || row >= motions_.size()) { QMessageBox::information(this, "动作播放", "请选择一条动作"); return; }
     const RecordedMotion &m = motions_[row].data;
     if (m.frames.first().size() != spSlaves_->value()) { QMessageBox::warning(this, "动作播放", "动作轴数与当前从站数不匹配"); return; }
-    for (const MotorStatus &s : worker_->snapshot()) if (s.isMotor && ((s.statusWord & (1 << 3)) || s.errorCode)) {
+    QVector<MotorStatus> snap = worker_->snapshot();
+    for (const MotorStatus &s : snap) if (s.isMotor && ((s.statusWord & (1 << 3)) || s.errorCode)) {
         QMessageBox::warning(this, "动作播放", "存在电机故障，请复位后再播放"); return;
     }
     pendingPlaybackMotion_ = m;
@@ -762,6 +763,35 @@ void MainWindow::onReturnMotion() {
     btnEnableAll_->setEnabled(false); btnFaultResetAll_->setEnabled(false);
     btnDisableRelease_->setEnabled(false); btnReturn_->setEnabled(false); btnReturnPlay_->setEnabled(false);
     btnPlay_->setEnabled(false);
+
+    bool anyMotor = false;
+    bool allMotorEnabled = true;
+    for (const MotorStatus &s : snap) {
+        if (!s.isMotor) continue;
+        anyMotor = true;
+        const uint16_t st = (uint16_t)(s.statusWord & 0x6F);
+        if (st != 0x27) {  // CiA402 OperationEnabled
+            allMotorEnabled = false;
+            break;
+        }
+    }
+    if (anyMotor && allMotorEnabled) {
+        playbackPreparing_ = false;
+        if (!worker_->beginMotionReturnToStart(pendingPlaybackMotion_, pendingPlaybackSpeed_)) {
+            tabs_->setEnabled(true); btnRecord_->setEnabled(true); btnPlay_->setEnabled(true);
+            btnReturn_->setEnabled(true); btnReturnPlay_->setEnabled(true);
+            btnEnableAll_->setEnabled(true); btnFaultResetAll_->setEnabled(true); btnDisableRelease_->setEnabled(true);
+            btnSdoSafe_->setEnabled(running_);
+            QMessageBox::warning(this, "回起点", "当前已使能，但回起点任务启动失败");
+            return;
+        }
+        playbackActive_ = true;
+        lblMotionState_->setText("回到动作起点");
+        appendLog(QString("回起点：检测到动作轴已处于使能状态，跳过失能/松闸，直接回到动作“%1”起点")
+            .arg(pendingPlaybackName_));
+        return;
+    }
+
     lblMotionState_->setText("正在松开抱闸...");
     setAllMotorCommandsDisabled();
     appendLog(QString("准备回到动作“%1”的起点：失能后自动松开全部抱闸").arg(pendingPlaybackName_));
@@ -772,8 +802,8 @@ void MainWindow::onReturnMotion() {
 
 void MainWindow::onReturnAndPlayMotion() {
     onReturnMotion();
-    /* 回起点准备是异步流程；只有 onReturnMotion 成功进入准备态才启用自动续播。 */
-    if (playbackPreparing_) {
+    /* 回起点可能处于松闸准备中，或已使能时直接开始回起点；两种情况均需自动续播。 */
+    if (playbackPreparing_ || playbackActive_) {
         autoPlayAfterReturn_ = true;
         appendLog("已选择快捷流程：到达起点后自动播放");
     }
@@ -817,9 +847,8 @@ void MainWindow::onMotionState(const QString &state) {
         }
     }
     if (state == "空闲" || state == "播放完成") {
-        if (playbackActive_) {
-            QTimer::singleShot(100, this, [this]{ writeAllBrakes(false, "WPLAYCLOSE"); });
-            appendLog("动作结束：已请求抱死所有电机抱闸");
+        if (state == "播放完成" && playbackActive_) {
+            appendLog("动作播放完成：保持使能，不自动抱闸");
             playbackActive_ = false;
         }
         tabs_->setEnabled(true); btnRecord_->setEnabled(true); btnPlay_->setEnabled(true);
