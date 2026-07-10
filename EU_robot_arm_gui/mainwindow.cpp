@@ -66,6 +66,8 @@ static QString swText(uint16_t sw) {
     return s;
 }
 
+static MotorCommand buildCmdFromPanel(const MotorPanel &p);
+
 /* ---------------------------------------------------------------- */
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     qRegisterMetaType<RecordedMotion>("RecordedMotion");
@@ -555,6 +557,12 @@ void MainWindow::onStop() {
 
 void MainWindow::onMasterStarted() {
     running_ = true;
+    for (int i = 0; i < panels_.size(); ++i) {
+        MotorCommand c = buildCmdFromPanel(panels_[i]);
+        c.enable = panels_[i].btnEnable->property("on").toBool();
+        c.hasTarget = false;
+        worker_->setCommand(i, c);
+    }
     btnStop_->setEnabled(true);
     btnSdoSafe_->setEnabled(true);
     lblMasterState_->setText("● 运行中");

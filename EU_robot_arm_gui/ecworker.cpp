@@ -548,7 +548,6 @@ void EcWorker::run() {
                 *(int32_t*) (domain_pd_ + off_tv_[i]) = 0;
                 *(int16_t*) (domain_pd_ + off_tt_[i]) = 0;
                 *(uint16_t*)(domain_pd_ + off_cw_[i]) = 0x02;
-                enabled_[i] = false;
                 ppPhase_[i] = 0;
                 continue;
             }
