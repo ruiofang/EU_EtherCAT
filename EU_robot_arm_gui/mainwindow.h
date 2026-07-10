@@ -78,6 +78,11 @@ private slots:
     void onBrakeClose(int motor);
     void onBrakeQuery(int motor);
     void onRecordToggle();
+    void onEnableAllMotion();
+    void onFaultResetAllMotion();
+    void onDisableReleaseAll();
+    void onReturnMotion();
+    void onReturnAndPlayMotion();
     void onPlayMotion();
     void onStopMotion();
     void onDeleteMotion();
@@ -91,6 +96,8 @@ private:
     void loadMotionLibrary();
     bool saveMotionLibrary();
     void refreshMotionList();
+    void setAllMotorCommandsDisabled();
+    void writeAllBrakes(bool open, const QString &tagPrefix);
 
     /* 顶部配置 */
     QSpinBox    *spSlaves_;
@@ -112,9 +119,22 @@ private:
 
     QListWidget  *motionList_;
     QSpinBox     *spRecordMs_, *spReturnSpeed_;
-    QPushButton  *btnRecord_, *btnPlay_, *btnMotionStop_, *btnMotionDelete_;
+    QPushButton  *btnRecord_, *btnEnableAll_, *btnFaultResetAll_, *btnDisableRelease_, *btnReturn_;
+    QPushButton  *btnPlay_, *btnReturnPlay_, *btnMotionStop_, *btnMotionDelete_;
     QLabel       *lblMotionState_;
     struct SavedMotion { QString name, created; RecordedMotion data; };
     QVector<SavedMotion> motions_;
     bool recording_ = false;
+    bool recordPreparing_ = false;
+    int pendingRecordBrakes_ = 0;
+    int failedRecordBrakes_ = 0;
+    int pendingRecordSampleMs_ = 20;
+    bool playbackPreparing_ = false;
+    int pendingPlaybackBrakes_ = 0;
+    int failedPlaybackBrakes_ = 0;
+    int pendingPlaybackSpeed_ = 100000;
+    RecordedMotion pendingPlaybackMotion_;
+    QString pendingPlaybackName_;
+    bool playbackActive_ = false;
+    bool autoPlayAfterReturn_ = false;
 };

@@ -106,7 +106,8 @@ public:
     void postSdo(const SdoJob &job);
     bool beginMotionRecord(int sampleMs);
     void endMotionRecord();
-    bool beginMotionPlayback(const RecordedMotion &motion, int returnSpeed);
+    bool beginMotionReturnToStart(const RecordedMotion &motion, int returnSpeed);
+    bool startPreparedMotionPlayback();
     void stopMotionActivity();
 
 signals:
@@ -159,7 +160,7 @@ private:
     QVector<uint32_t>     lastSeq_;    // 上次已处理的 applySeq，用于检测"新一次应用"
     QVector<uint8_t>      ppPhase_;    // PP/PV/HM new_setpoint 脉冲状态机：0=idle,1=置位等待 ack,2=清位等待 ack 回落
 
-    enum MotionMode { MotionIdle, MotionRecording, MotionReturning, MotionPlaying };
+    enum MotionMode { MotionIdle, MotionRecording, MotionReturning, MotionReady, MotionPlaying };
     QMutex motionMtx_;
     MotionMode motionMode_ = MotionIdle;
     RecordedMotion recorded_, playback_;

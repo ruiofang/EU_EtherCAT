@@ -2,6 +2,7 @@
 
 #include <QMutexLocker>
 #include <QDateTime>
+#include <QElapsedTimer>
 #include <unistd.h>
 #include <time.h>
 #include <cstring>
@@ -103,7 +104,7 @@ void EcWorker::endMotionRecord() {
     emit motionRecordFinished(out);
 }
 
-bool EcWorker::beginMotionPlayback(const RecordedMotion &motion, int returnSpeed) {
+bool EcWorker::beginMotionReturnToStart(const RecordedMotion &motion, int returnSpeed) {
     if (!running_ || motion.frames.size() < 2 || motion.sampleMs < 1 || returnSpeed <= 0)
         return false;
     for (const auto &f : motion.frames) if (f.size() != cfg_.slaveCount) return false;
@@ -118,6 +119,15 @@ bool EcWorker::beginMotionPlayback(const RecordedMotion &motion, int returnSpeed
         motionMode_ = MotionReturning;
     }
     emit motionStateChanged("回到动作起点");
+    return true;
+}
+
+bool EcWorker::startPreparedMotionPlayback() {
+    QMutexLocker ml(&motionMtx_);
+    if (!running_ || motionMode_ != MotionReady || playback_.frames.size() < 2) return false;
+    playTick_ = 0;
+    motionMode_ = MotionPlaying;
+    emit motionStateChanged("播放中");
     return true;
 }
 
@@ -288,17 +298,25 @@ bool EcWorker::initMaster() {
     }
     domain_pd_ = ecrt_domain_data(domain_);
     if (!domain_pd_) { emit errorOccurred("domain data 未就绪"); return false; }
+    /* 与 EU 官方 demo 一致：激活后先清零整个过程数据区，避免上次进程残值影响 SM watchdog。 */
+    std::memset(domain_pd_, 0, ecrt_domain_size(domain_));
 
     /* 等待所有电机从站进入 OP（非电机位置未配置，不会被 IgH 尝试带到 OP，不阻塞本流程） */
     emit logMessage("等待电机从站进入 OP ...");
-    const int maxTicks = 10000;   // 最多等 10s
-    int lastLogTick = -1;
+    const int startupSleepUs = 500;       // EU demo 建议启动握手快于正常 PDO 周期
+    const int firstRetryTick = 20000;     // 10 s 时触发一次 IgH slave-config FSM 重试
+    const int maxTicks = 50000;           // 总计最多约 25 s
+    QElapsedTimer startupTimer; startupTimer.start();
     for (int tick = 0; tick < maxTicks && running_; ++tick) {
         ecrt_master_receive(master_);
         ecrt_domain_process(domain_);
         ecrt_domain_queue(domain_);
         ecrt_master_send(master_);
-        if (tick % 500 == 499 || tick == 0) {
+        if (tick == firstRetryTick) {
+            int rc = ecrt_master_reset(master_);
+            emit logMessage(QString("从站未全部 OP，触发 IgH 配置状态机重试 ecrt_master_reset rc=%1").arg(rc));
+        }
+        if (tick % 1000 == 999 || tick == 0) {
             QString prog;
             int opCnt = 0;
             ec_slave_config_state_t st{};
@@ -310,17 +328,19 @@ bool EcWorker::initMaster() {
                     .arg(st.online ? "on" : "off");
                 if (st.al_state == EC_AL_STATE_OP) ++opCnt;
             }
-            if (tick != lastLogTick) {
-                emit logMessage(QString("电机进度 t=%1ms 已OP=%2/%3 |%4")
-                    .arg(tick).arg(opCnt).arg(motorCount).arg(prog));
-                lastLogTick = tick;
-            }
+            ec_master_state_t ms{}; ecrt_master_state(master_, &ms);
+            ec_domain_state_t ds{}; ecrt_domain_state(domain_, &ds);
+            emit logMessage(QString("电机进度 t=%1ms 已OP=%2/%3 master响应=%4 AL汇总=0x%5 "
+                                    "domainWC=%6/%7 |%8")
+                .arg(startupTimer.elapsed()).arg(opCnt).arg(motorCount)
+                .arg(ms.slaves_responding).arg(ms.al_states, 1, 16)
+                .arg(ds.working_counter).arg((int)ds.wc_state).arg(prog));
             if (opCnt == motorCount) {
                 emit logMessage(QString("全部 %1 个电机从站进入 OP").arg(motorCount));
                 return true;
             }
         }
-        usleep(1000);
+        usleep(startupSleepUs);
     }
     /* 超时，打印最终状态 */
     {
@@ -333,7 +353,12 @@ bool EcWorker::initMaster() {
                 .arg(i).arg(st.al_state, 2, 16, QChar('0'))
                 .arg(st.online).arg(st.operational);
         }
-        emit errorOccurred(QString("超时：电机从站未全部进入 OP；%1").arg(prog));
+        ec_master_state_t ms{}; ecrt_master_state(master_, &ms);
+        ec_domain_state_t ds{}; ecrt_domain_state(domain_, &ds);
+        emit errorOccurred(QString("超时：约 %1ms 后电机从站未全部进入 OP；master响应=%2 "
+                                   "AL汇总=0x%3 domainWC=%4/%5；%6")
+            .arg(startupTimer.elapsed()).arg(ms.slaves_responding)
+            .arg(ms.al_states, 1, 16).arg(ds.working_counter).arg((int)ds.wc_state).arg(prog));
     }
     return false;
 }
@@ -464,7 +489,7 @@ void EcWorker::run() {
             QMutexLocker ml(&motionMtx_);
             activeMotion = motionMode_;
         }
-        if ((activeMotion == MotionReturning || activeMotion == MotionPlaying)
+        if ((activeMotion == MotionReturning || activeMotion == MotionReady || activeMotion == MotionPlaying)
                 && motionTarget_.size() != cfg_.slaveCount) {
             motionTarget_.fill(0, cfg_.slaveCount);
             for (int i = 0; i < cfg_.slaveCount; ++i)
@@ -512,7 +537,7 @@ void EcWorker::run() {
             MotorCommand &c = cmdLocal[i];
             if (activeMotion == MotionRecording) {
                 c.enable = false;
-            } else if (activeMotion == MotionReturning || activeMotion == MotionPlaying) {
+            } else if (activeMotion == MotionReturning || activeMotion == MotionReady || activeMotion == MotionPlaying) {
                 c.enable = true;
                 c.opMode = MODE_CSP;
             }
@@ -530,8 +555,6 @@ void EcWorker::run() {
                 /* 消费一次后清零 */
                 QMutexLocker lk(&mtx_);
                 if (i < cmds_.size()) cmds_[i].faultReset = false;
-            } else if (sw & (1 << 3)) {      // Fault
-                ctrl = 0x80;
             } else if (!c.enable) {
                 ctrl = 0x06;                  // Shutdown
                 enabled_[i] = false;
@@ -541,6 +564,9 @@ void EcWorker::run() {
                     case 0x21:            ctrl = 0x07; break;           // Ready -> SwitchOn
                     case 0x23:            ctrl = 0x0F; break;           // SwitchedOn -> EnableOperation
                     case 0x27:            ctrl = 0x0F; enabled_[i]=true; break; // Operation enabled
+                    case 0x07:            ctrl = 0x0F; break;           // QuickStopActive -> EnableOperation
+                    case 0x0F:            ctrl = 0x00; break;           // FaultReactionActive: 等待进入 Fault
+                    case 0x08:            ctrl = 0x80; break;           // Fault -> FaultReset
                     default:              ctrl = 0x06; break;
                 }
             }
@@ -598,6 +624,9 @@ void EcWorker::run() {
                 } else {
                     motionTarget_[i] = ap;
                 }
+                *(int32_t*)(domain_pd_ + off_tp_[i]) = motionTarget_[i];
+            } else if (activeMotion == MotionReady) {
+                motionTarget_[i] = playback_.frames.first()[i];
                 *(int32_t*)(domain_pd_ + off_tp_[i]) = motionTarget_[i];
             } else if (activeMotion == MotionPlaying) {
                 const int64_t elapsedUs = (int64_t)playTick_ * periodUs;
@@ -666,14 +695,17 @@ void EcWorker::run() {
             bool reached = true, allEnabled = true;
             for (int i = 0; i < cfg_.slaveCount; ++i) if (isMotor_[i]) {
                 allEnabled &= enabled_[i];
-                reached &= (motionTarget_[i] == playback_.frames.first()[i]);
+                const int64_t actualError = (int64_t)stLocal[i].actualPos - playback_.frames.first()[i];
+                /* 目标发生器到位且实际位置误差不超过 100 encoder counts 才算真正回到起点。 */
+                reached &= (motionTarget_[i] == playback_.frames.first()[i]
+                         && qAbs(actualError) <= 100);
             }
             if (allEnabled && reached) {
                 QMutexLocker ml(&motionMtx_);
                 if (motionMode_ == MotionReturning) {
-                    motionMode_ = MotionPlaying;
+                    motionMode_ = MotionReady;
                     playTick_ = 0;
-                    emit motionStateChanged("播放中");
+                    emit motionStateChanged("已到起点");
                 }
             }
         } else if (activeMotion == MotionPlaying) {
@@ -734,6 +766,17 @@ void EcWorker::run() {
                     .arg(*(uint16_t*)(domain_pd_ + off_sw_[i]), 4, 16, QChar('0'))
                     .arg(ap).arg(curTp_[i]).arg(goal)
                     .arg(c.jogStep > 0 ? c.jogStep : 500));
+            }
+            if (activeMotion == MotionReturning) {
+                QString detail;
+                for (int i = 0; i < cfg_.slaveCount; ++i) if (isMotor_[i]) {
+                    detail += QString(" #%1 SW=0x%2 EN=%3 AP=%4 TP=%5 START=%6 ERR=%7")
+                        .arg(i).arg(stLocal[i].statusWord, 4, 16, QChar('0'))
+                        .arg(enabled_[i]).arg(stLocal[i].actualPos).arg(motionTarget_[i])
+                        .arg(playback_.frames.first()[i])
+                        .arg((int64_t)stLocal[i].actualPos - playback_.frames.first()[i]);
+                }
+                emit logMessage("回起点诊断 |" + detail);
             }
         }
     }

@@ -107,7 +107,7 @@ void MainWindow::closeEvent(QCloseEvent *event) {
 
 /* ---------------------------------------------------------------- */
 void MainWindow::buildUi() {
-    setWindowTitle("EtherCAT 电机调试工具 (IgH Master)");
+    setWindowTitle("EU EtherCAT 机械臂动作录制与播放");
     /* 初始尺寸适中；低分辨率(1366x768)也能放下，最小尺寸给足滚动空间 */
     resize(1100, 720);
     setMinimumSize(900, 560);
@@ -188,7 +188,6 @@ void MainWindow::buildUi() {
     root->addWidget(gbTop);
 
     /* ========= 机械臂动作示教 ========= */
-
     auto *gbMotion = new QGroupBox("机械臂动作录制与播放", central);
     auto *motionLay = new QGridLayout(gbMotion);
     motionList_ = new QListWidget;
@@ -197,18 +196,31 @@ void MainWindow::buildUi() {
     spRecordMs_ = new QSpinBox; spRecordMs_->setRange(5, 200); spRecordMs_->setValue(20); spRecordMs_->setSuffix(" ms");
     spReturnSpeed_ = new QSpinBox; spReturnSpeed_->setRange(100, INT_MAX); spReturnSpeed_->setValue(100000); spReturnSpeed_->setSuffix(" 脉冲/s");
     btnRecord_ = new QPushButton("开始录制（失能）");
-    btnPlay_ = new QPushButton("回起点并播放");
+    btnEnableAll_ = new QPushButton("使能");
+    btnFaultResetAll_ = new QPushButton("一键故障复位");
+    btnDisableRelease_ = new QPushButton("失能并松开抱闸");
+    btnReturn_ = new QPushButton("回起点");
+    btnPlay_ = new QPushButton("播放");
+    btnReturnPlay_ = new QPushButton("回起点并播放");
     btnMotionStop_ = new QPushButton("停止动作");
     btnMotionDelete_ = new QPushButton("删除所选");
     lblMotionState_ = new QLabel("空闲");
-    motionLay->addWidget(motionList_, 0, 0, 3, 1);
+    motionLay->addWidget(motionList_, 0, 0, 4, 1);
     motionLay->addWidget(new QLabel("采样周期:"), 0, 1); motionLay->addWidget(spRecordMs_, 0, 2);
     motionLay->addWidget(new QLabel("回起点速度:"), 1, 1); motionLay->addWidget(spReturnSpeed_, 1, 2);
-    motionLay->addWidget(btnRecord_, 0, 3); motionLay->addWidget(btnPlay_, 0, 4);
-    motionLay->addWidget(btnMotionStop_, 1, 3); motionLay->addWidget(btnMotionDelete_, 1, 4);
-    motionLay->addWidget(new QLabel("状态:"), 2, 1); motionLay->addWidget(lblMotionState_, 2, 2, 1, 3);
+    motionLay->addWidget(btnRecord_, 0, 3); motionLay->addWidget(btnMotionDelete_, 0, 4);
+    motionLay->addWidget(btnEnableAll_, 1, 3); motionLay->addWidget(btnDisableRelease_, 1, 4);
+    motionLay->addWidget(btnFaultResetAll_, 2, 2);
+    motionLay->addWidget(btnReturn_, 2, 3); motionLay->addWidget(btnPlay_, 2, 4);
+    motionLay->addWidget(btnReturnPlay_, 3, 3); motionLay->addWidget(btnMotionStop_, 3, 4);
+    motionLay->addWidget(new QLabel("状态:"), 3, 1); motionLay->addWidget(lblMotionState_, 3, 2, 1, 1);
     motionLay->setColumnStretch(0, 1);
     connect(btnRecord_, &QPushButton::clicked, this, &MainWindow::onRecordToggle);
+    connect(btnEnableAll_, &QPushButton::clicked, this, &MainWindow::onEnableAllMotion);
+    connect(btnFaultResetAll_, &QPushButton::clicked, this, &MainWindow::onFaultResetAllMotion);
+    connect(btnDisableRelease_, &QPushButton::clicked, this, &MainWindow::onDisableReleaseAll);
+    connect(btnReturn_, &QPushButton::clicked, this, &MainWindow::onReturnMotion);
+    connect(btnReturnPlay_, &QPushButton::clicked, this, &MainWindow::onReturnAndPlayMotion);
     connect(btnPlay_, &QPushButton::clicked, this, &MainWindow::onPlayMotion);
     connect(btnMotionStop_, &QPushButton::clicked, this, &MainWindow::onStopMotion);
     connect(btnMotionDelete_, &QPushButton::clicked, this, &MainWindow::onDeleteMotion);
@@ -553,6 +565,11 @@ void MainWindow::onMasterStarted() {
 void MainWindow::onMasterStopped() {
     running_ = false;
     recording_ = false;
+    recordPreparing_ = false;
+    pendingRecordBrakes_ = 0;
+    playbackPreparing_ = false;
+    playbackActive_ = false;
+    pendingPlaybackBrakes_ = 0;
     timer_->stop();
     btnStart_->setEnabled(true);
     btnStop_->setEnabled(false);
@@ -639,19 +656,32 @@ void MainWindow::refreshMotionList() {
 
 void MainWindow::onRecordToggle() {
     if (!worker_ || !running_) { QMessageBox::information(this, "动作录制", "请先启动 EtherCAT 主站"); return; }
-    if (!recording_) {
-        if (!worker_->beginMotionRecord(spRecordMs_->value())) {
-            QMessageBox::warning(this, "动作录制", "无法开始：已有录制或播放任务"); return;
-        }
-        recording_ = true; btnRecord_->setText("停止录制并保存");
-        tabs_->setEnabled(false); btnPlay_->setEnabled(false); btnSdoSafe_->setEnabled(false);
-        appendLog(QString("开始动作录制，采样周期 %1 ms；所有电机保持失能").arg(spRecordMs_->value()));
+    if (!recording_ && !recordPreparing_) {
+        recordPreparing_ = true;
+        pendingRecordSampleMs_ = spRecordMs_->value();
+        pendingRecordBrakes_ = 0;
+        failedRecordBrakes_ = 0;
+        btnRecord_->setEnabled(false);
+        tabs_->setEnabled(false); btnPlay_->setEnabled(false); btnReturn_->setEnabled(false); btnReturnPlay_->setEnabled(false);
+        btnEnableAll_->setEnabled(false); btnFaultResetAll_->setEnabled(false);
+        btnDisableRelease_->setEnabled(false); btnSdoSafe_->setEnabled(false);
+        lblMotionState_->setText("正在失能并松开抱闸...");
+        setAllMotorCommandsDisabled();
+        appendLog("准备录制：先失能所有电机，再自动松开所有 EU 电机抱闸");
+        /* 给 CiA402 状态机若干周期完成失能，再通过 SDO 操作机械抱闸。 */
+        QTimer::singleShot(100, this, [this] {
+            if (recordPreparing_ && worker_ && running_) writeAllBrakes(true, "WRECBRK");
+        });
     } else worker_->endMotionRecord();
 }
 
 void MainWindow::onMotionRecorded(RecordedMotion motion) {
     recording_ = false; btnRecord_->setText("开始录制（失能）");
-    tabs_->setEnabled(true); btnPlay_->setEnabled(true); btnSdoSafe_->setEnabled(running_);
+    tabs_->setEnabled(true); btnPlay_->setEnabled(true); btnReturn_->setEnabled(true); btnReturnPlay_->setEnabled(true);
+    btnEnableAll_->setEnabled(true); btnFaultResetAll_->setEnabled(true);
+    btnDisableRelease_->setEnabled(true); btnSdoSafe_->setEnabled(running_);
+    writeAllBrakes(false, "WRECCLOSE");
+    appendLog("录制结束：已请求抱死所有电机抱闸");
     if (motion.frames.size() < 2) { QMessageBox::warning(this, "动作录制", "有效采样不足 2 帧，未保存"); return; }
     bool ok = false;
     QString name = QInputDialog::getText(this, "保存动作", "动作名称:", QLineEdit::Normal, QString(), &ok).trimmed();
@@ -667,7 +697,54 @@ void MainWindow::onMotionRecorded(RecordedMotion motion) {
     }
 }
 
-void MainWindow::onPlayMotion() {
+void MainWindow::onEnableAllMotion() {
+    if (!worker_ || !running_) { QMessageBox::information(this, "机械臂使能", "请先启动 EtherCAT 主站"); return; }
+    QVector<MotorStatus> states = worker_->snapshot();
+    for (int i = 0; i < panels_.size(); ++i) {
+        bool motor = i < states.size() ? states[i].isMotor
+                                       : (i >= motorMask_.size() || motorMask_[i]);
+        if (motor) onEnable(i);
+    }
+    lblMotionState_->setText("已请求全部使能");
+    appendLog("机械臂：已向所有 EU 电机发送使能请求");
+}
+
+void MainWindow::onFaultResetAllMotion() {
+    if (!worker_ || !running_) { QMessageBox::information(this, "一键故障复位", "请先启动 EtherCAT 主站"); return; }
+    QVector<MotorStatus> states = worker_->snapshot();
+    int count = 0;
+    for (int i = 0; i < panels_.size(); ++i) {
+        bool motor = i < states.size() ? states[i].isMotor
+                                       : (i >= motorMask_.size() || motorMask_[i]);
+        if (!motor) continue;
+        MotorCommand c;
+        c.opMode = MODE_CSP;
+        c.enable = false;       // 复位时不自动重新使能，防止机械臂意外运动
+        c.hasTarget = false;
+        c.faultReset = true;    // EcWorker 消费后自动清零，形成单次 0x0080 脉冲
+        worker_->setCommand(i, c);
+        panels_[i].btnEnable->setProperty("on", false);
+        ++count;
+    }
+    lblMotionState_->setText("已发送一键故障复位");
+    appendLog(QString("一键故障复位：已向 %1 个 EU 电机发送 Controlword 0x0080 脉冲").arg(count));
+}
+
+void MainWindow::onDisableReleaseAll() {
+    if (!worker_ || !running_) { QMessageBox::information(this, "机械臂失能", "请先启动 EtherCAT 主站"); return; }
+    playbackPreparing_ = false;
+    worker_->stopMotionActivity();
+    setAllMotorCommandsDisabled();
+    lblMotionState_->setText("正在失能并松开抱闸...");
+    QTimer::singleShot(100, this, [this] {
+        writeAllBrakes(true, "WFREEBRK");
+        lblMotionState_->setText("已失能并请求松开抱闸");
+        appendLog("机械臂：所有电机已失能，并请求松开全部抱闸");
+    });
+}
+
+void MainWindow::onReturnMotion() {
+    autoPlayAfterReturn_ = false;
     int row = motionList_->currentRow();
     if (!worker_ || !running_) { QMessageBox::information(this, "动作播放", "请先启动 EtherCAT 主站"); return; }
     if (worker_->sdoSafeMode()) { QMessageBox::information(this, "动作播放", "请先退出 SDO 调参模式"); return; }
@@ -677,14 +754,51 @@ void MainWindow::onPlayMotion() {
     for (const MotorStatus &s : worker_->snapshot()) if (s.isMotor && ((s.statusWord & (1 << 3)) || s.errorCode)) {
         QMessageBox::warning(this, "动作播放", "存在电机故障，请复位后再播放"); return;
     }
-    if (!worker_->beginMotionPlayback(m, spReturnSpeed_->value())) {
-        QMessageBox::warning(this, "动作播放", "无法播放：当前已有动作任务或轨迹无效"); return;
-    }
+    pendingPlaybackMotion_ = m;
+    pendingPlaybackSpeed_ = spReturnSpeed_->value();
+    pendingPlaybackName_ = motions_[row].name;
+    playbackPreparing_ = true; failedPlaybackBrakes_ = 0; pendingPlaybackBrakes_ = 0;
     tabs_->setEnabled(false); btnRecord_->setEnabled(false); btnSdoSafe_->setEnabled(false);
-    appendLog(QString("播放动作“%1”：先以 %2 脉冲/s 回到起点").arg(motions_[row].name).arg(spReturnSpeed_->value()));
+    btnEnableAll_->setEnabled(false); btnFaultResetAll_->setEnabled(false);
+    btnDisableRelease_->setEnabled(false); btnReturn_->setEnabled(false); btnReturnPlay_->setEnabled(false);
+    btnPlay_->setEnabled(false);
+    lblMotionState_->setText("正在松开抱闸...");
+    setAllMotorCommandsDisabled();
+    appendLog(QString("准备回到动作“%1”的起点：失能后自动松开全部抱闸").arg(pendingPlaybackName_));
+    QTimer::singleShot(100, this, [this] {
+        if (playbackPreparing_ && worker_ && running_) writeAllBrakes(true, "WPLAYBRK");
+    });
 }
 
-void MainWindow::onStopMotion() { if (worker_) worker_->stopMotionActivity(); }
+void MainWindow::onReturnAndPlayMotion() {
+    onReturnMotion();
+    /* 回起点准备是异步流程；只有 onReturnMotion 成功进入准备态才启用自动续播。 */
+    if (playbackPreparing_) {
+        autoPlayAfterReturn_ = true;
+        appendLog("已选择快捷流程：到达起点后自动播放");
+    }
+}
+
+void MainWindow::onPlayMotion() {
+    if (!worker_ || !running_) { QMessageBox::information(this, "动作播放", "请先启动 EtherCAT 主站"); return; }
+    if (!worker_->startPreparedMotionPlayback()) {
+        QMessageBox::information(this, "动作播放", "请先选择动作并点击“回起点”，等待状态显示“已到起点”后再播放");
+        return;
+    }
+    playbackActive_ = true;
+    btnReturn_->setEnabled(false);
+    btnReturnPlay_->setEnabled(false);
+    appendLog("从当前动作起点开始播放轨迹");
+}
+
+void MainWindow::onStopMotion() {
+    autoPlayAfterReturn_ = false;
+    playbackPreparing_ = false;
+    if (worker_) worker_->stopMotionActivity();
+    if (playbackActive_ || pendingPlaybackBrakes_ > 0)
+        QTimer::singleShot(100, this, [this]{ writeAllBrakes(false, "WPLAYCLOSE"); });
+    playbackActive_ = false;
+}
 
 void MainWindow::onDeleteMotion() {
     int row = motionList_->currentRow(); if (row < 0 || row >= motions_.size()) return;
@@ -694,9 +808,66 @@ void MainWindow::onDeleteMotion() {
 
 void MainWindow::onMotionState(const QString &state) {
     lblMotionState_->setText(state); appendLog("机械臂动作状态: " + state);
+    if (state == "已到起点") {
+        btnPlay_->setEnabled(true);
+        btnMotionStop_->setEnabled(true);
+        if (autoPlayAfterReturn_) {
+            autoPlayAfterReturn_ = false;
+            QTimer::singleShot(0, this, &MainWindow::onPlayMotion);
+        }
+    }
     if (state == "空闲" || state == "播放完成") {
+        if (playbackActive_) {
+            QTimer::singleShot(100, this, [this]{ writeAllBrakes(false, "WPLAYCLOSE"); });
+            appendLog("动作结束：已请求抱死所有电机抱闸");
+            playbackActive_ = false;
+        }
         tabs_->setEnabled(true); btnRecord_->setEnabled(true); btnPlay_->setEnabled(true);
+        btnReturn_->setEnabled(true); btnReturnPlay_->setEnabled(true);
+        btnEnableAll_->setEnabled(true); btnFaultResetAll_->setEnabled(true); btnDisableRelease_->setEnabled(true);
         btnSdoSafe_->setEnabled(running_);
+    }
+}
+
+void MainWindow::setAllMotorCommandsDisabled() {
+    if (!worker_) return;
+    QVector<MotorStatus> states = worker_->snapshot();
+    for (int i = 0; i < panels_.size(); ++i) {
+        bool motor = i < states.size() ? states[i].isMotor
+                                       : (i >= motorMask_.size() || motorMask_[i]);
+        if (motor) onDisable(i);
+    }
+}
+
+void MainWindow::writeAllBrakes(bool open, const QString &tagPrefix) {
+    if (!worker_ || !running_) return;
+    QVector<MotorStatus> states = worker_->snapshot();
+    int count = 0;
+    for (int i = 0; i < panels_.size(); ++i) {
+        bool motor = i < states.size() ? states[i].isMotor
+                                       : (i >= motorMask_.size() || motorMask_[i]);
+        if (!motor) continue;
+        SdoJob j; j.slave = i; j.index = 0x2014; j.subindex = 1;
+        j.bits = 8; j.isSigned = false; j.write = true; j.value = open ? 1 : 0;
+        j.tag = QString("%1/M%2/%3").arg(tagPrefix).arg(i).arg(open ? "open" : "close");
+        worker_->postSdo(j); ++count;
+    }
+    if (tagPrefix == "WRECBRK") {
+        pendingRecordBrakes_ = count;
+        if (count == 0) {
+            recordPreparing_ = false;
+            btnRecord_->setEnabled(true);
+            tabs_->setEnabled(true); btnPlay_->setEnabled(true); btnSdoSafe_->setEnabled(running_);
+            QMessageBox::warning(this, "动作录制", "没有识别到可松闸的 EU 电机");
+        }
+    } else if (tagPrefix == "WPLAYBRK") {
+        pendingPlaybackBrakes_ = count;
+        if (count == 0) {
+            playbackPreparing_ = false;
+            tabs_->setEnabled(true); btnRecord_->setEnabled(true); btnPlay_->setEnabled(true);
+            btnSdoSafe_->setEnabled(running_);
+            QMessageBox::warning(this, "动作播放", "没有识别到可松闸的 EU 电机");
+        }
     }
 }
 
@@ -942,6 +1113,62 @@ void MainWindow::onSdoResult(SdoResult r) {
                                  : QString("OK 写入完成: %1").arg(r.value))
         : QString("失败: %1").arg(r.err);
     appendLog(QString("[SDO %1] %2").arg(r.tag).arg(txt));
+
+    /* 录制准备流程：只有全部电机确认松闸写入成功后才开始位置采样。 */
+    if (r.tag.startsWith("WRECBRK/")) {
+        if (!r.ok) ++failedRecordBrakes_;
+        if (pendingRecordBrakes_ > 0) --pendingRecordBrakes_;
+        if (pendingRecordBrakes_ == 0 && recordPreparing_) {
+            recordPreparing_ = false;
+            if (failedRecordBrakes_ > 0) {
+                writeAllBrakes(false, "WRECCLOSE");
+                btnRecord_->setEnabled(true);
+                tabs_->setEnabled(true); btnPlay_->setEnabled(true); btnSdoSafe_->setEnabled(running_);
+                lblMotionState_->setText("松开抱闸失败");
+                QMessageBox::warning(this, "动作录制",
+                    QString("有 %1 个电机松开抱闸失败，已取消录制并重新抱闸。请检查 0x2014 对象和驱动器状态。")
+                        .arg(failedRecordBrakes_));
+            } else if (!worker_->beginMotionRecord(pendingRecordSampleMs_)) {
+                writeAllBrakes(false, "WRECCLOSE");
+                btnRecord_->setEnabled(true);
+                tabs_->setEnabled(true); btnPlay_->setEnabled(true); btnSdoSafe_->setEnabled(running_);
+                QMessageBox::warning(this, "动作录制", "松闸成功，但无法开始录制：已有其他动作任务");
+            } else {
+                recording_ = true;
+                btnRecord_->setText("停止录制并保存"); btnRecord_->setEnabled(true);
+                appendLog(QString("全部电机抱闸已松开，开始动作录制，采样周期 %1 ms")
+                    .arg(pendingRecordSampleMs_));
+                /* 读取实际抱闸状态用于面板回显，不作为写成功后的额外阻塞条件。 */
+                for (int i = 0; i < panels_.size(); ++i) onBrakeQuery(i);
+            }
+        }
+    }
+
+    /* 播放准备流程：播放前也必须先松开所有轴抱闸。 */
+    if (r.tag.startsWith("WPLAYBRK/")) {
+        if (!r.ok) ++failedPlaybackBrakes_;
+        if (pendingPlaybackBrakes_ > 0) --pendingPlaybackBrakes_;
+        if (pendingPlaybackBrakes_ == 0 && playbackPreparing_) {
+            playbackPreparing_ = false;
+            if (failedPlaybackBrakes_ > 0) {
+                writeAllBrakes(false, "WPLAYCLOSE");
+                tabs_->setEnabled(true); btnRecord_->setEnabled(true); btnPlay_->setEnabled(true);
+                btnSdoSafe_->setEnabled(running_); lblMotionState_->setText("播放松闸失败");
+                QMessageBox::warning(this, "动作播放",
+                    QString("有 %1 个电机松开抱闸失败，已取消播放。")
+                        .arg(failedPlaybackBrakes_));
+            } else if (!worker_->beginMotionReturnToStart(pendingPlaybackMotion_, pendingPlaybackSpeed_)) {
+                writeAllBrakes(false, "WPLAYCLOSE");
+                tabs_->setEnabled(true); btnRecord_->setEnabled(true); btnPlay_->setEnabled(true);
+                btnSdoSafe_->setEnabled(running_);
+                QMessageBox::warning(this, "回起点", "松闸成功，但回起点任务启动失败");
+            } else {
+                playbackActive_ = true;
+                appendLog(QString("全部电机抱闸已松开，以 %2 脉冲/s 回到动作“%1”的实际起点")
+                    .arg(pendingPlaybackName_).arg(pendingPlaybackSpeed_));
+            }
+        }
+    }
 
     /* 抱闸状态专用回显 */
     if (r.tag.contains("BRK") && motor >= 0 && motor < panels_.size()) {
