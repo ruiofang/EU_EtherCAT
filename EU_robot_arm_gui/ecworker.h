@@ -37,6 +37,7 @@ struct MotorStatus {
     bool     isMotor    = false;   // 是否匹配 cfg.vendor/product 的电机从站
     uint32_t vendorId   = 0;       // 总线读到的实际 vendor
     uint32_t productCode= 0;       // 总线读到的实际 product
+    uint32_t revisionNumber=0;     // EEPROM 中的固件/ESI 修订号（143 或 145）
 };
 
 struct MotorCommand {

@@ -28,7 +28,12 @@ public:
         connect(&input_, &QSocketNotifier::activated, this, [this] { readCommand(); });
         /* CLI 默认静默运行：不转发周期诊断等普通日志，避免刷屏和终端 I/O 抢占。 */
         connect(&worker_, &EcWorker::errorOccurred, this, [this](const QString &s) { out("[错误] " + s); });
-        connect(&worker_, &EcWorker::masterStarted, this, [this] { running_ = true; out("主站已启动"); showMenu(); });
+        connect(&worker_, &EcWorker::masterStarted, this, [this] {
+            running_ = true;
+            setEnableAll(true);
+            out("主站已启动：已自动请求使能全部 EU 电机（CSP 当前位置保持）");
+            showMenu();
+        });
         connect(&worker_, &EcWorker::masterStopped, this, [this] { running_ = false; out("主站已停止"); });
         connect(&worker_, &EcWorker::motionStateChanged, this, [this](const QString &s) {
             motionState_ = s; out("[动作] " + s);
@@ -257,7 +262,11 @@ private:
         if (choice == 1) {
             out(QString("主站=%1 动作状态=%2").arg(running_ ? "运行" : "停止", motionState_));
             auto s = worker_.snapshot(); for (int i=0;i<s.size();++i) if(s[i].isMotor)
-                out(QString("#%1 AL=0x%2 SW=0x%3 POS=%4 ERR=0x%5").arg(i).arg(s[i].alState,2,16,QChar('0')).arg(s[i].statusWord,4,16,QChar('0')).arg(s[i].actualPos).arg(s[i].errorCode,4,16,QChar('0')));
+                out(QString("#%1 AL=0x%2 SW=0x%3 ENABLED=%4 POS=%5 ERR=0x%6")
+                    .arg(i).arg(s[i].alState,2,16,QChar('0'))
+                    .arg(s[i].statusWord,4,16,QChar('0'))
+                    .arg((s[i].statusWord & 0x6F) == 0x27 ? "YES" : "NO")
+                    .arg(s[i].actualPos).arg(s[i].errorCode,4,16,QChar('0')));
         } else if (choice == 2) {
             for (const auto &m : motions_) out(QString("%1  %2帧  %3ms/帧").arg(m.name).arg(m.data.frames.size()).arg(m.data.sampleMs));
         } else if (choice == 3) setEnableAll(true);

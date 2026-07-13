@@ -449,12 +449,17 @@ void MainWindow::onScan() {
         ec_slave_info_t si{};
         if (ecrt_master_get_slave(m, (uint16_t)i, &si) == 0) {
             infos[i] = si;
-            appendLog(QString("  #%1  vendor=0x%2 product=0x%3 AL=0x%4 名称=\"%5\"")
+            const QString xml = si.revision_number == 143
+                ? "EYOU_ServoModule_ECAT_V143.xml"
+                : (si.revision_number == 145 ? "EYOU_ServoModule_ECAT_V145.xml" : "<不支持>");
+            appendLog(QString("  #%1  vendor=0x%2 product=0x%3 revision=V%4 AL=0x%5 名称=\"%6\" XML=%7")
                 .arg(i)
                 .arg(si.vendor_id, 8, 16, QChar('0'))
                 .arg(si.product_code, 8, 16, QChar('0'))
+                .arg(si.revision_number)
                 .arg(si.al_state, 2, 16, QChar('0'))
-                .arg(QString::fromUtf8(si.name)));
+                .arg(QString::fromUtf8(si.name))
+                .arg(xml));
             if (i == 0) { firstVendor = si.vendor_id; firstProduct = si.product_code; }
             else if (si.vendor_id != firstVendor || si.product_code != firstProduct) allSame = false;
         } else {
@@ -559,14 +564,20 @@ void MainWindow::onMasterStarted() {
     running_ = true;
     for (int i = 0; i < panels_.size(); ++i) {
         MotorCommand c = buildCmdFromPanel(panels_[i]);
-        c.enable = panels_[i].btnEnable->property("on").toBool();
+        const bool isMotor = i >= motorMask_.size() || motorMask_[i];
+        c.enable = isMotor; // 启动后自动使能所有已识别电机
         c.hasTarget = false;
         worker_->setCommand(i, c);
+        if (isMotor) {
+            panels_[i].btnEnable->setProperty("on", true);
+            panels_[i].btnEnable->setStyleSheet("background:#8f8;font-weight:bold;");
+        }
     }
     btnStop_->setEnabled(true);
     btnSdoSafe_->setEnabled(true);
     lblMasterState_->setText("● 运行中");
     lblMasterState_->setStyleSheet("color:green;font-weight:bold;");
+    appendLog("主站已启动：已自动请求使能全部 EU 电机（CSP 当前位置保持）");
     timer_->start();
 }
 

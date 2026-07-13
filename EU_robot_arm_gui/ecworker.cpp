@@ -45,6 +45,17 @@ static ec_sync_info_t g_syncs[] = {
     {0xff}
 };
 
+/* IgH ecrt 不会在运行时解析 ESI XML；此绑定用来根据 EEPROM
+   RevisionNo 选择与之匹配的 ESI 定义。两个版本当前使用的
+   0x1600/0x1A00 PDO 布局相同，由上面的 g_syncs 下发。 */
+static const char *xmlForRevision(uint32_t revision) {
+    switch (revision) {
+    case 143: return "EYOU_ServoModule_ECAT_V143.xml";
+    case 145: return "EYOU_ServoModule_ECAT_V145.xml";
+    default:  return nullptr;
+    }
+}
+
 /* ================================================================ */
 EcWorker::EcWorker(QObject *parent) : QThread(parent) {}
 
@@ -221,6 +232,7 @@ bool EcWorker::initMaster() {
         }
         s.vendorId    = si.vendor_id;
         s.productCode = si.product_code;
+        s.revisionNumber = si.revision_number;
 
         bool isMotor;
         if (useMaskHint) {
@@ -232,6 +244,20 @@ bool EcWorker::initMaster() {
         s.isMotor   = isMotor;
 
         if (isMotor) {
+            /* 主站进入周期后自动推进 CiA402 使能状态机。hasTarget=false
+               会在 Operation Enabled 瞬间捕获实际位置并原位保持，不会跳到零点。 */
+            cmds_[i].opMode = MODE_CSP;
+            cmds_[i].enable = true;
+            cmds_[i].hasTarget = false;
+            const char *xml = xmlForRevision(si.revision_number);
+            if (!xml) {
+                emit errorOccurred(QString("从站 %1 的电机版本 RevisionNo=%2 不受支持；"
+                                            "只能绑定 V143 或 V145 XML")
+                                     .arg(i).arg(si.revision_number));
+                return false;
+            }
+            emit logMessage(QString("从站 %1: V%2 -> 绑定 xml/%3")
+                            .arg(i).arg(si.revision_number).arg(xml));
             /* 仅为电机从站创建 slave_config 并下发 PDO，非电机从站不做任何配置，
                IgH 就不会试图把它拉到 OP，从而不会阻塞电机 activate 过程 */
             sc_[i] = ecrt_master_slave_config(master_, 0, i, si.vendor_id, si.product_code);
@@ -541,13 +567,29 @@ void EcWorker::run() {
             /* ----- CiA402 状态机 ----- */
             MotorCommand &c = cmdLocal[i];
             if (stopping) {
-                /* 退出时不可直接撤掉 PDO：先用 Quick Stop 让驱动受控减速，
-                   并将所有目标锁定为当前反馈，避免继续执行未完成的轨迹。 */
+                /* 退出时逐轴保留原使能状态：已失能轴继续 Shutdown，
+                   已使能或正在执行轨迹的轴改用 CSP 锁定当前反馈位置，
+                   等待实际速度归零后保持 Operation Enabled 释放主站。 */
+                const bool trajectoryActive = activeMotion == MotionReturning
+                                           || activeMotion == MotionReady
+                                           || activeMotion == MotionPlaying;
+                const bool keepEnabled = c.enable || trajectoryActive;
                 *(int8_t*)  (domain_pd_ + off_om_[i]) = MODE_CSP;
                 *(int32_t*) (domain_pd_ + off_tp_[i]) = ap;
                 *(int32_t*) (domain_pd_ + off_tv_[i]) = 0;
                 *(int16_t*) (domain_pd_ + off_tt_[i]) = 0;
-                *(uint16_t*)(domain_pd_ + off_cw_[i]) = 0x02;
+                uint16_t holdCtrl = 0x06; // 原为失能请求时绝不重新使能
+                if (keepEnabled) {
+                    switch (sw & 0x6F) {
+                        case 0x00: case 0x40: holdCtrl = 0x06; break;
+                        case 0x21:            holdCtrl = 0x07; break;
+                        case 0x23: case 0x27: case 0x07: holdCtrl = 0x0F; break;
+                        case 0x0F:            holdCtrl = 0x00; break;
+                        case 0x08:            holdCtrl = 0x80; break;
+                        default:              holdCtrl = 0x06; break;
+                    }
+                }
+                *(uint16_t*)(domain_pd_ + off_cw_[i]) = holdCtrl;
                 ppPhase_[i] = 0;
                 continue;
             }
@@ -759,7 +801,7 @@ void EcWorker::run() {
                 }
             }
             if (++stopCycles == 1)
-                emit logMessage("退出请求：已下发所有电机 Quick Stop，等待速度归零");
+                emit logMessage("退出请求：保留各轴原使能/失能状态；运动轴已用 CSP 锁定当前位置，等待速度归零");
             /* 至少发送 3 个周期；异常时最多等待 1 秒，避免退出无限阻塞。 */
             if (stopCycles >= 3 && (allStopped || stopCycles >= 1000000 / periodUs))
                 running_ = false;
