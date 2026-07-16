@@ -143,6 +143,8 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> stopRequested_{false};
     std::atomic<bool> sdoSafe_{false};
+    bool opStartupTimedOut_ = false;
+    int  startupAttempt_ = 0;
 
     ec_master_t *master_ = nullptr;
     ec_domain_t *domain_ = nullptr;

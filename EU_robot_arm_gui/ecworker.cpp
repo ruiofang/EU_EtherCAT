@@ -202,6 +202,7 @@ private:
 
 /* ================================================================ */
 bool EcWorker::initMaster() {
+    opStartupTimedOut_ = false;
     const int N = cfg_.slaveCount;
     cmds_.clear();   cmds_.resize(N);
     status_.clear(); status_.resize(N);
@@ -357,7 +358,7 @@ bool EcWorker::initMaster() {
     const int startupSleepUs = qMax(1000, cfg_.cycleUs);
     const int progressTicks = qMax(1, 100000 / startupSleepUs); // 每 100ms 检查一次
     const int firstRetryTick = qMax(1, 5000000 / startupSleepUs); // 5s 重试
-    const int maxTicks = qMax(1, 25000000 / startupSleepUs);      // 最多 25s
+    const int maxTicks = qMax(1, 8000000 / startupSleepUs);       // 单次最多 8s
     QElapsedTimer startupTimer; startupTimer.start();
     for (int tick = 0; tick < maxTicks && running_ && !stopRequested_; ++tick) {
         ecrt_master_receive(master_);
@@ -411,10 +412,13 @@ bool EcWorker::initMaster() {
         }
         ec_master_state_t ms{}; ecrt_master_state(master_, &ms);
         ec_domain_state_t ds{}; ecrt_domain_state(domain_, &ds);
-        emit errorOccurred(QString("超时：约 %1ms 后电机从站未全部进入 OP；master响应=%2 "
-                                   "AL汇总=0x%3 domainWC=%4/%5；%6")
+        opStartupTimedOut_ = true;
+        const QString message = QString("超时：约 %1ms 后电机从站未全部进入 OP；master响应=%2 "
+                                        "AL汇总=0x%3 domainWC=%4/%5；%6")
             .arg(startupTimer.elapsed()).arg(ms.slaves_responding)
-            .arg(ms.al_states, 1, 16).arg(ds.working_counter).arg((int)ds.wc_state).arg(prog));
+            .arg(ms.al_states, 1, 16).arg(ds.working_counter).arg((int)ds.wc_state).arg(prog);
+        if (startupAttempt_ >= 2) emit errorOccurred(message);
+        else emit logMessage("<警告> " + message);
     }
     return false;
 }
@@ -488,7 +492,20 @@ void EcWorker::run() {
         }
     }
 
-    if (!initMaster()) { cleanup(); running_ = false; emit masterStopped(); return; }
+    bool masterReady = false;
+    for (startupAttempt_ = 1; startupAttempt_ <= 2 && !stopRequested_; ++startupAttempt_) {
+        emit logMessage(QString("EtherCAT 主站启动尝试 %1/2").arg(startupAttempt_));
+        if (initMaster()) {
+            masterReady = true;
+            break;
+        }
+        const bool retryOp = opStartupTimedOut_ && startupAttempt_ < 2 && !stopRequested_;
+        cleanup();
+        if (!retryOp) break;
+        emit logMessage("首次进入 OP 超时：完整释放 Master，500ms 后自动重新初始化");
+        usleep(500000);
+    }
+    if (!masterReady) { cleanup(); running_ = false; emit masterStopped(); return; }
 
     /* 先启动 SDO 子线程再通知 GUI，避免按钮刚启用时提交的首个请求被误判为停止中。 */
     sdoRun_ = true;

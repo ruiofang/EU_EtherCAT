@@ -11,7 +11,6 @@
 #include <QSaveFile>
 #include <QSettings>
 #include <QSocketNotifier>
-#include <QStandardPaths>
 #include <QTextStream>
 #include <QTextCodec>
 #include <QTimer>
@@ -147,12 +146,14 @@ private:
     }
 
     QString libraryPath() const {
-        QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-        QDir().mkpath(dir); return dir + "/robot_motions.json";
+        return QCoreApplication::applicationDirPath() + "/robot_motions.json";
     }
 
     void loadMotions() {
-        motions_.clear(); QFile f(libraryPath());
+        motions_.clear();
+        const QString path = libraryPath();
+        restoreSudoUserOwnership(path);
+        QFile f(path);
         if (!f.open(QIODevice::ReadOnly)) return;
         QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
         for (const auto &v : doc.object().value("motions").toArray()) {
@@ -180,8 +181,12 @@ private:
             o["frames"] = frames; list.append(o);
         }
         QJsonObject root; root["version"] = 1; root["motions"] = list;
-        QSaveFile f(libraryPath());
-        return f.open(QIODevice::WriteOnly) && f.write(QJsonDocument(root).toJson()) >= 0 && f.commit();
+        const QString path = libraryPath();
+        QSaveFile f(path);
+        const bool ok = f.open(QIODevice::WriteOnly)
+                     && f.write(QJsonDocument(root).toJson()) >= 0 && f.commit();
+        if (ok) restoreSudoUserOwnership(path);
+        return ok;
     }
 
     const CliMotion *findMotion(const QString &name) const {
@@ -366,7 +371,7 @@ int main(int argc, char **argv) {
     QTextCodec::setCodecForLocale(QTextCodec::codecForName("UTF-8"));
     QCoreApplication app(argc, argv);
     QCoreApplication::setOrganizationName("");
-    QCoreApplication::setApplicationName("EU_robot_arm_gui"); // 与 GUI 共用动作库目录
+    QCoreApplication::setApplicationName("EU_robot_arm_gui");
     /* EcWorker 在独立线程发出这些信号，CLI 也必须注册队列连接参数。 */
     qRegisterMetaType<SdoResult>("SdoResult");
     qRegisterMetaType<MotorStatus>("MotorStatus");

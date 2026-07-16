@@ -32,7 +32,6 @@
 #include <QFileInfo>
 #include <QSaveFile>
 #include <QDir>
-#include <QStandardPaths>
 #include <QSettings>
 #include <climits>
 #include <sys/stat.h>
@@ -686,14 +685,14 @@ void MainWindow::onMasterStopped() {
 
 /* ================= 机械臂动作库 ================= */
 static QString motionLibraryPath() {
-    QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-    QDir().mkpath(dir);
-    return dir + "/robot_motions.json";
+    return QApplication::applicationDirPath() + "/robot_motions.json";
 }
 
 void MainWindow::loadMotionLibrary() {
     motions_.clear();
-    QFile f(motionLibraryPath());
+    const QString path = motionLibraryPath();
+    restoreSudoUserOwnership(path);
+    QFile f(path);
     if (!f.exists()) { refreshMotionList(); return; }
     if (!f.open(QIODevice::ReadOnly)) { appendLog("<警告> 无法读取动作库: " + f.errorString()); return; }
     QJsonParseError pe;
@@ -731,10 +730,12 @@ bool MainWindow::saveMotionLibrary() {
         o["frames"] = frames; list.append(o);
     }
     QJsonObject root; root["version"] = 1; root["motions"] = list;
-    QSaveFile f(motionLibraryPath());
+    const QString path = motionLibraryPath();
+    QSaveFile f(path);
     if (!f.open(QIODevice::WriteOnly) || f.write(QJsonDocument(root).toJson()) < 0 || !f.commit()) {
         QMessageBox::warning(this, "动作库", "保存失败: " + f.errorString()); return false;
     }
+    restoreSudoUserOwnership(path);
     return true;
 }
 
@@ -1263,7 +1264,12 @@ void MainWindow::onSdoResult(SdoResult r) {
                 appendLog(QString("全部电机抱闸已松开，开始动作录制，采样周期 %1 ms")
                     .arg(pendingRecordSampleMs_));
                 /* 读取实际抱闸状态用于面板回显，不作为写成功后的额外阻塞条件。 */
-                for (int i = 0; i < panels_.size(); ++i) onBrakeQuery(i);
+                const QVector<MotorStatus> states = worker_->snapshot();
+                for (int i = 0; i < panels_.size(); ++i) {
+                    const bool motor = i < states.size() ? states[i].isMotor
+                                                        : (i >= motorMask_.size() || motorMask_[i]);
+                    if (motor) onBrakeQuery(i);
+                }
             }
         }
     }
@@ -1340,6 +1346,11 @@ void MainWindow::onBrakeClose(int motor) {
 
 void MainWindow::onBrakeQuery(int motor) {
     if (!worker_) return;
+    const QVector<MotorStatus> states = worker_->snapshot();
+    const bool isMotor = motor >= 0 && motor < states.size()
+                       ? states[motor].isMotor
+                       : (motor >= 0 && (motor >= motorMask_.size() || motorMask_[motor]));
+    if (!isMotor) return;
     SdoJob j; j.slave = motor; j.index = 0x2014; j.subindex = 2;
     j.bits = 8; j.isSigned = false; j.write = false;
     j.tag = QString("RBRK/M%1/state").arg(motor);

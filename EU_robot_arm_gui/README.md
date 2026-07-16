@@ -16,6 +16,9 @@
 - CiA402 状态机自动推进（`0x06 → 0x07 → 0x0F`，Fault → 0x80 复位）
 - 主站启动成功后自动使能全部已识别 EU 电机，默认使用 CSP 捕获并保持当前位置，避免使能瞬间跳变；GUI Status Word 和 CLI `ENABLED=YES/NO` 显示实际使能状态
 - 退出受控停机：关闭 GUI、停止主站或 CLI 退出时逐轴保留原使能状态；已失能轴保持 Shutdown，已使能轴保持 Operation Enabled。若正在运动，则先取消轨迹、切换 CSP 锁定当前反馈位置并将速度/力矩目标清零，实际速度归零后再释放主站（异常时最多等待 1 秒）
+- SDO 使用独立线程处理；退出时取消排队请求，并在当前 SDO 完成或超时前继续维持 PDO 通信，避免停止过程死锁
+- 首次进入 OP 若有个别轴停在 SAFE-OP，单次等待 8 秒后会完整释放并重新申请 Master，再自动尝试一次；第二次仍失败才报告启动错误
+- GUI 可选择是否保存日志；GUI、CLI、配置和动作库均统一使用可执行文件所在目录
 
 ## 依赖
 
@@ -30,10 +33,8 @@ sudo apt install qtbase5-dev cmake build-essential
 ## 编译
 
 ```bash
-cd EU_robot_arm_gui
-mkdir -p build && cd build
-cmake ..
-make -j
+cmake -S EU_robot_arm_gui -B EU_robot_arm_gui/build
+cmake --build EU_robot_arm_gui/build -j
 ```
 
 ## 运行
@@ -41,10 +42,31 @@ make -j
 需要 root 权限（访问 EtherCAT 字符设备）：
 
 ```bash
-sudo ./EU_robot_arm_gui
+sudo -E ./EU_robot_arm_gui/build/EU_robot_arm_gui
 ```
 
 > 建议：赋予 `cap_sys_nice` / `cap_ipc_lock` 以获得更稳定的实时性，或使用 PREEMPT_RT 内核。
+
+## 程序目录文件
+
+GUI 和 CLI 只使用可执行文件所在目录中的配置、日志和动作文件，不会在
+`~/.config`、`~/.local/share` 或 `/root/.local/share` 中创建副本：
+
+```text
+build/
+  EU_robot_arm_gui.conf   # 共用配置，saveLog=true/false
+  robot_motions.json      # GUI/CLI 共用动作库，唯一存储位置
+  log/
+    yyyyMMdd_HHmmss_zzz.log
+    yyyyMMdd_HHmmss_zzz_cli.log
+```
+
+通过 `sudo` 启动时，程序会根据 `SUDO_UID/SUDO_GID` 将上述目录和文件归还
+给发起 `sudo` 的普通用户。配置和数据文件权限为 `0664`，日志目录权限为
+`0775`，后续可直接用普通用户编辑。
+
+GUI 顶部的“保存日志”复选框控制 `saveLog`。CLI 读取同一配置：关闭时仍
+保留终端输出，但不创建 CLI 日志；开启时普通 EtherCAT 诊断只写文件，不刷屏。
 
 ## 使用流程
 
@@ -55,7 +77,7 @@ sudo ./EU_robot_arm_gui
 
 1. 启动主站，确认所有 EU 电机进入 OP，机械臂处于可安全手动拖动的环境。
 2. 根据机构需要先处理抱闸，然后点击“开始录制（失能）”。录制期间程序持续发送失能控制字，只采集各轴 `0x6064` 实际位置。默认每 20 ms 采一帧（50 Hz）。
-3. 手动拖动机械臂完成示教，再点击“停止录制并保存”，输入自定义动作名称。动作以 JSON 保存在系统应用数据目录的 `robot_motions.json`，支持多条动作、覆盖和删除。
+3. 手动拖动机械臂完成示教，再点击“停止录制并保存”，输入自定义动作名称。动作以 JSON 保存在可执行文件同目录的 `robot_motions.json`，GUI 与 CLI 共用，支持多条动作、覆盖和删除。通过 `sudo` 运行时文件会自动归还给发起 `sudo` 的普通用户。
 4. 选择动作并设置“回起点速度”（编码器脉冲/秒），点击“回起点”。程序会松开抱闸、以 CSP 同步使能各轴并限速移动到首帧；状态显示“已到起点”后，点击独立的“播放”按钮按录制时间执行轨迹。
 5. 回起点或播放期间可随时点击“停止动作”；所有轴退出使能请求并停止轨迹执行。
 
@@ -79,7 +101,7 @@ sudo ./EU_robot_arm_gui
 启动：
 
 ```bash
-cd /home/ruio/data/123/国家电网/EU_EtherCAT
+cd /home/ruio/data/123/EU_EtherCAT
 sudo -E ./EU_robot_arm_gui/build/EU_robot_arm_cli
 ```
 
@@ -117,16 +139,12 @@ CLI 默认不输出周期诊断等普通 EtherCAT 日志，只显示错误、SDO
 请选择> 10
 动作编号（0取消）> 2
 ```
-3. 启动本程序 → 填入从站数、VendorID、ProductID → **启动主站**
-4. 等待日志出现 "所有从站进入 OP"
-5. 在电机 Tab 选择模式 → 点 **使能** → 填目标值 → **应用**
-6. 使用 SDO 区读写 0x6083（加速度）/ 0x6084（减速度）/ 0x6081（轮廓速度）/ 0x607D（软限位）等调试参数
-
 ## 停止与退出
 
 - 点击“停止主站”、关闭 GUI 窗口、收到 `SIGINT`/`SIGTERM`，以及 CLI 选择 `0. 退出`，都会进入相同的受控停机流程。
 - 实时线程会立即中止正在执行的回起点或轨迹播放，用 CSP 锁定当前反馈位置，并至少持续发送 3 个 EtherCAT 周期。
 - 当全部已识别电机的实际速度接近零后，程序才释放 EtherCAT Master；若驱动未在 1 秒内反馈停止，程序仍会继续退出，避免界面或 CLI 无限等待。
+- 若停止时已有阻塞式 SDO 正在执行，排队中的 SDO 会立即取消，但 PDO 周期会继续运行直到当前 SDO 返回。当前设备的 SDO 超时通常约 9 秒，因此停止可能延迟，但不会形成“先停 PDO、再无限等待 SDO”的死锁。
 - 主站释放后能否继续保持使能，由驱动器 EtherCAT watchdog/通讯中断策略决定。真实机械臂必须保留独立硬件急停和抱闸等安全回路，不能将软件退出流程作为安全功能的替代。
 
 ## 默认 Vendor/Product
@@ -150,7 +168,8 @@ EU_robot_arm_gui/
 
 ## 注意事项
 
-- SDO 请求在 RT 线程的周期末尾（每 100 周期 = 100ms）批处理，避免抖动
+- SDO 请求在独立线程中串行处理，避免阻塞 EtherCAT 实时周期；停止过程中不再接受新请求
+- 抱闸 SDO `0x2014` 只发送给识别出的 EU 电机，不会查询 EtherCAT HUB 或不匹配的产品型号
 - 模式切换最好在 **关闭** 状态下进行，或选择支持 OP 中切换的驱动
 - CSP 未使能时目标位置自动跟随实际位置，防止再次使能瞬间跳动
 - 扫描会读取电机 EEPROM `RevisionNo`：V143 绑定 `xml/EYOU_ServoModule_ECAT_V143.xml`，V145 绑定 `xml/EYOU_ServoModule_ECAT_V145.xml`；其他版本会拒绝启动，避免使用错误 PDO 定义
