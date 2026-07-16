@@ -81,12 +81,6 @@ struct EcConfig {
     QVector<bool> motorMask;
 };
 
-struct RecordedMotion {
-    int sampleMs = 20;
-    QVector<QVector<int32_t>> frames; // 每帧与总线位置等长，非电机位置为 0
-};
-Q_DECLARE_METATYPE(RecordedMotion)
-
 class EcWorker : public QThread {
     Q_OBJECT
 public:
@@ -104,10 +98,6 @@ public:
     void setCommand(int slave, const MotorCommand &cmd);
     QVector<MotorStatus> snapshot();
     void postSdo(const SdoJob &job);
-    bool beginMotionRecord(int sampleMs);
-    void endMotionRecord();
-    bool beginMotionPlayback(const RecordedMotion &motion, int returnSpeed);
-    void stopMotionActivity();
 
 signals:
     void logMessage(QString msg);
@@ -115,8 +105,6 @@ signals:
     void masterStopped();
     void errorOccurred(QString msg);
     void sdoFinished(SdoResult res);
-    void motionRecordFinished(RecordedMotion motion);
-    void motionStateChanged(QString state);
 
 protected:
     void run() override;
@@ -158,13 +146,4 @@ private:
     QVector<int32_t>      curTp_;      // CSP 每周期实际下发的目标位置（用于梯形限速逼近 targetPos）
     QVector<uint32_t>     lastSeq_;    // 上次已处理的 applySeq，用于检测"新一次应用"
     QVector<uint8_t>      ppPhase_;    // PP/PV/HM new_setpoint 脉冲状态机：0=idle,1=置位等待 ack,2=清位等待 ack 回落
-
-    enum MotionMode { MotionIdle, MotionRecording, MotionReturning, MotionPlaying };
-    QMutex motionMtx_;
-    MotionMode motionMode_ = MotionIdle;
-    RecordedMotion recorded_, playback_;
-    int recordTick_ = 0;
-    int returnSpeed_ = 100000;          // encoder counts / s
-    QVector<int32_t> motionTarget_;
-    int playTick_ = 0;
 };

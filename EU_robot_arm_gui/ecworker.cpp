@@ -65,7 +65,17 @@ EcWorker::~EcWorker() {
 }
 
 void EcWorker::configure(const EcConfig &cfg) { cfg_ = cfg; }
-void EcWorker::requestStop()                  { stopRequested_ = true; }
+void EcWorker::requestStop() {
+    /* 先关 SDO 入口，再发布 stopRequested_。如果 SDO 线程刚取走任务，
+       它会在持有同一把锁时先置 sdoBusy_，RT 线程不会误判为可以退出。 */
+    {
+        QMutexLocker lk(&sdoMtx_);
+        sdoRun_ = false;
+        sdoQueue_.clear();
+        sdoCv_.wakeAll();
+    }
+    stopRequested_ = true;
+}
 
 void EcWorker::setCommand(int slave, const MotorCommand &cmd) {
     QMutexLocker lk(&mtx_);
@@ -84,6 +94,13 @@ QVector<MotorStatus> EcWorker::snapshot() {
 
 void EcWorker::postSdo(const SdoJob &job) {
     QMutexLocker lk(&sdoMtx_);
+    if (!sdoRun_ || stopRequested_) {
+        SdoResult res;
+        res.tag = job.tag;
+        res.err = "主站正在停止，SDO 请求已取消";
+        emit sdoFinished(res);
+        return;
+    }
     sdoQueue_.enqueue(job);
     sdoCv_.wakeOne();
 }
@@ -172,8 +189,11 @@ protected:
                 if (!w_->sdoRun_) return;
                 if (w_->sdoQueue_.isEmpty()) continue;
                 job = w_->sdoQueue_.dequeue();
+                /* 必须在释放队列锁之前置 busy，和 requestStop() 建立可靠顺序。 */
+                w_->sdoBusy_ = true;
             }
             w_->doOneSdo(job);
+            w_->sdoBusy_ = false;
         }
     }
 private:
@@ -332,11 +352,14 @@ bool EcWorker::initMaster() {
 
     /* 等待所有电机从站进入 OP（非电机位置未配置，不会被 IgH 尝试带到 OP，不阻塞本流程） */
     emit logMessage("等待电机从站进入 OP ...");
-    const int startupSleepUs = 500;       // EU demo 建议启动握手快于正常 PDO 周期
-    const int firstRetryTick = 20000;     // 10 s 时触发一次 IgH slave-config FSM 重试
-    const int maxTicks = 50000;           // 总计最多约 25 s
+    /* 启动阶段也按用户配置周期发送 PDO。此前固定 500us 会把 USB 网卡负载
+       翻倍，非实时系统上反而更容易触发从站 SM watchdog。 */
+    const int startupSleepUs = qMax(1000, cfg_.cycleUs);
+    const int progressTicks = qMax(1, 100000 / startupSleepUs); // 每 100ms 检查一次
+    const int firstRetryTick = qMax(1, 5000000 / startupSleepUs); // 5s 重试
+    const int maxTicks = qMax(1, 25000000 / startupSleepUs);      // 最多 25s
     QElapsedTimer startupTimer; startupTimer.start();
-    for (int tick = 0; tick < maxTicks && running_; ++tick) {
+    for (int tick = 0; tick < maxTicks && running_ && !stopRequested_; ++tick) {
         ecrt_master_receive(master_);
         ecrt_domain_process(domain_);
         ecrt_domain_queue(domain_);
@@ -345,7 +368,7 @@ bool EcWorker::initMaster() {
             int rc = ecrt_master_reset(master_);
             emit logMessage(QString("从站未全部 OP，触发 IgH 配置状态机重试 ecrt_master_reset rc=%1").arg(rc));
         }
-        if (tick % 1000 == 999 || tick == 0) {
+        if (tick % progressTicks == progressTicks - 1 || tick == 0) {
             QString prog;
             int opCnt = 0;
             ec_slave_config_state_t st{};
@@ -370,6 +393,10 @@ bool EcWorker::initMaster() {
             }
         }
         usleep(startupSleepUs);
+    }
+    if (stopRequested_) {
+        emit logMessage("启动过程中收到停止请求，取消等待 OP");
+        return false;
     }
     /* 超时，打印最终状态 */
     {
@@ -462,12 +489,12 @@ void EcWorker::run() {
     }
 
     if (!initMaster()) { cleanup(); running_ = false; emit masterStopped(); return; }
-    emit masterStarted();
 
-    /* 启动 SDO 子线程 */
+    /* 先启动 SDO 子线程再通知 GUI，避免按钮刚启用时提交的首个请求被误判为停止中。 */
     sdoRun_ = true;
     sdoThread_ = new SdoThread(this);
     sdoThread_->start();
+    emit masterStarted();
 
     const int periodUs = cfg_.cycleUs > 0 ? cfg_.cycleUs : 1000;
     struct timespec wakeup; clock_gettime(CLOCK_MONOTONIC, &wakeup);
@@ -484,6 +511,7 @@ void EcWorker::run() {
     long overrunCnt = 0;
     const long thresholdNs = (long)periodUs * 1000L * 3 / 2;  // 超过 1.5× 视为 overrun
     int stopCycles = 0;
+    bool stopSdoWaitLogged = false;
 
     while (running_) {
         /* 等到下一个周期 */
@@ -802,9 +830,16 @@ void EcWorker::run() {
             }
             if (++stopCycles == 1)
                 emit logMessage("退出请求：保留各轴原使能/失能状态；运动轴已用 CSP 锁定当前位置，等待速度归零");
-            /* 至少发送 3 个周期；异常时最多等待 1 秒，避免退出无限阻塞。 */
-            if (stopCycles >= 3 && (allStopped || stopCycles >= 1000000 / periodUs))
+            /* 激活状态下的阻塞式 ecrt_master_sdo_* 依赖本循环继续收发
+               EtherCAT 帧。以前这里先停 PDO 再 wait SDO，会形成永久死锁。 */
+            if (sdoBusy_) {
+                if (!stopSdoWaitLogged) {
+                    emit logMessage("停止主站：取消排队中的 SDO，继续 PDO 通信并等待当前 SDO 请求结束");
+                    stopSdoWaitLogged = true;
+                }
+            } else if (stopCycles >= 3 && (allStopped || stopCycles >= 1000000 / periodUs)) {
                 running_ = false;
+            }
         }
 
         /* --- 本周期负载时间 --- */

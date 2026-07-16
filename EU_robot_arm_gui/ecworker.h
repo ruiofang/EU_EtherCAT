@@ -137,6 +137,7 @@ private:
     QWaitCondition  sdoCv_;
     QQueue<SdoJob>  sdoQueue_;
     std::atomic<bool> sdoRun_{false};
+    std::atomic<bool> sdoBusy_{false}; // 当前是否阻塞在 ecrt_master_sdo_* 调用中
 
     EcConfig cfg_;
     std::atomic<bool> running_{false};

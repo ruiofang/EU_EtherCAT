@@ -76,63 +76,6 @@ void EcWorker::postSdo(const SdoJob &job) {
     sdoCv_.wakeOne();
 }
 
-bool EcWorker::beginMotionRecord(int sampleMs) {
-    if (!running_ || sampleMs < 5 || sampleMs > 1000) return false;
-    {
-        QMutexLocker ml(&motionMtx_);
-        if (motionMode_ != MotionIdle) return false;
-        { QMutexLocker lk(&mtx_); for (MotorCommand &c : cmds_) c.enable = false; }
-        recorded_ = RecordedMotion{};
-        recorded_.sampleMs = sampleMs;
-        recordTick_ = 0;
-        motionMode_ = MotionRecording;
-    }
-    emit motionStateChanged("录制中（电机失能）");
-    return true;
-}
-
-void EcWorker::endMotionRecord() {
-    RecordedMotion out;
-    {
-        QMutexLocker ml(&motionMtx_);
-        if (motionMode_ != MotionRecording) return;
-        motionMode_ = MotionIdle;
-        out = recorded_;
-    }
-    emit motionStateChanged("空闲");
-    emit motionRecordFinished(out);
-}
-
-bool EcWorker::beginMotionPlayback(const RecordedMotion &motion, int returnSpeed) {
-    if (!running_ || motion.frames.size() < 2 || motion.sampleMs < 1 || returnSpeed <= 0)
-        return false;
-    for (const auto &f : motion.frames) if (f.size() != cfg_.slaveCount) return false;
-    {
-        QMutexLocker ml(&motionMtx_);
-        if (motionMode_ != MotionIdle) return false;
-        { QMutexLocker lk(&mtx_); for (MotorCommand &c : cmds_) c.enable = false; }
-        playback_ = motion;
-        returnSpeed_ = returnSpeed;
-        motionTarget_.clear();
-        playTick_ = 0;
-        motionMode_ = MotionReturning;
-    }
-    emit motionStateChanged("回到动作起点");
-    return true;
-}
-
-void EcWorker::stopMotionActivity() {
-    RecordedMotion out; bool hadRecording = false;
-    {
-        QMutexLocker ml(&motionMtx_);
-        if (motionMode_ == MotionRecording) { out = recorded_; hadRecording = true; }
-        motionMode_ = MotionIdle;
-        { QMutexLocker lk(&mtx_); for (MotorCommand &c : cmds_) c.enable = false; }
-    }
-    if (hadRecording) emit motionRecordFinished(out);
-    emit motionStateChanged("空闲");
-}
-
 /* ================= SDO 子线程 ================= */
 class EcWorker::SdoThread : public QThread {
 public:
@@ -459,18 +402,6 @@ void EcWorker::run() {
             cmdLocal = cmds_;
         }
 
-        MotionMode activeMotion;
-        {
-            QMutexLocker ml(&motionMtx_);
-            activeMotion = motionMode_;
-        }
-        if ((activeMotion == MotionReturning || activeMotion == MotionPlaying)
-                && motionTarget_.size() != cfg_.slaveCount) {
-            motionTarget_.fill(0, cfg_.slaveCount);
-            for (int i = 0; i < cfg_.slaveCount; ++i)
-                if (isMotor_[i]) motionTarget_[i] = *(int32_t*)(domain_pd_ + off_ap_[i]);
-        }
-
         QVector<MotorStatus> stLocal(cfg_.slaveCount);
         for (int i = 0; i < cfg_.slaveCount; ++i) {
             /* 非电机位置：仅刷新 AL/在线信息，不读写 PDO、不运行状态机 */
@@ -510,12 +441,6 @@ void EcWorker::run() {
 
             /* ----- CiA402 状态机 ----- */
             MotorCommand &c = cmdLocal[i];
-            if (activeMotion == MotionRecording) {
-                c.enable = false;
-            } else if (activeMotion == MotionReturning || activeMotion == MotionPlaying) {
-                c.enable = true;
-                c.opMode = MODE_CSP;
-            }
             *(int8_t*)(domain_pd_ + off_om_[i]) = c.opMode;
 
             bool prevEnabled = enabled_[i];
@@ -585,32 +510,6 @@ void EcWorker::run() {
             *(int32_t*) (domain_pd_ + off_tv_[i]) = c.targetVel;
             *(int16_t*) (domain_pd_ + off_tt_[i]) = c.targetTor;
 
-            /* 机械臂轨迹对 CSP 绝对目标拥有最高优先级，所有轴共用同一 playTick。 */
-            if (activeMotion == MotionReturning) {
-                if (enabled_[i]) {
-                    const int32_t goal = playback_.frames.first()[i];
-                    const int64_t maxStep64 = qMax<int64_t>(1, (int64_t)returnSpeed_ * periodUs / 1000000);
-                    const int32_t maxStep = (int32_t)qMin<int64_t>(maxStep64, INT_MAX);
-                    const int64_t diff = (int64_t)goal - motionTarget_[i];
-                    if (diff > maxStep) motionTarget_[i] += maxStep;
-                    else if (diff < -maxStep) motionTarget_[i] -= maxStep;
-                    else motionTarget_[i] = goal;
-                } else {
-                    motionTarget_[i] = ap;
-                }
-                *(int32_t*)(domain_pd_ + off_tp_[i]) = motionTarget_[i];
-            } else if (activeMotion == MotionPlaying) {
-                const int64_t elapsedUs = (int64_t)playTick_ * periodUs;
-                const int64_t frameUs = (int64_t)playback_.sampleMs * 1000;
-                int a = (int)(elapsedUs / frameUs);
-                if (a >= playback_.frames.size() - 1) a = playback_.frames.size() - 1;
-                int b = qMin(a + 1, playback_.frames.size() - 1);
-                const int64_t rem = elapsedUs - (int64_t)a * frameUs;
-                const int64_t p0 = playback_.frames[a][i], p1 = playback_.frames[b][i];
-                motionTarget_[i] = (int32_t)(p0 + (p1 - p0) * rem / frameUs);
-                *(int32_t*)(domain_pd_ + off_tp_[i]) = motionTarget_[i];
-            }
-
             /* ===== PP / PV / HM：new_setpoint 脉冲握手 =====
                - 用户每点"应用目标值" applySeq 会自增
                - 收到新 seq 时进入 phase1：CW bit4=1 (new setpoint) + bit5=1 (change set immediately)
@@ -650,42 +549,6 @@ void EcWorker::run() {
         {
             QMutexLocker lk(&mtx_);
             status_ = stLocal;
-        }
-
-
-        if (activeMotion == MotionRecording) {
-            const int every = qMax(1, recorded_.sampleMs * 1000 / periodUs);
-            if (recordTick_++ % every == 0) {
-                QVector<int32_t> frame(cfg_.slaveCount, 0);
-                for (int i = 0; i < cfg_.slaveCount; ++i)
-                    if (isMotor_[i]) frame[i] = stLocal[i].actualPos;
-                QMutexLocker ml(&motionMtx_);
-                if (motionMode_ == MotionRecording) recorded_.frames.push_back(frame);
-            }
-        } else if (activeMotion == MotionReturning) {
-            bool reached = true, allEnabled = true;
-            for (int i = 0; i < cfg_.slaveCount; ++i) if (isMotor_[i]) {
-                allEnabled &= enabled_[i];
-                reached &= (motionTarget_[i] == playback_.frames.first()[i]);
-            }
-            if (allEnabled && reached) {
-                QMutexLocker ml(&motionMtx_);
-                if (motionMode_ == MotionReturning) {
-                    motionMode_ = MotionPlaying;
-                    playTick_ = 0;
-                    emit motionStateChanged("播放中");
-                }
-            }
-        } else if (activeMotion == MotionPlaying) {
-            const int64_t totalUs = (int64_t)(playback_.frames.size() - 1) * playback_.sampleMs * 1000;
-            if ((int64_t)playTick_ * periodUs >= totalUs) {
-                QMutexLocker ml(&motionMtx_);
-                if (motionMode_ == MotionPlaying) {
-                    motionMode_ = MotionIdle;
-                    { QMutexLocker lk(&mtx_); for (MotorCommand &c : cmds_) c.enable = false; }
-                    emit motionStateChanged("播放完成");
-                }
-            } else ++playTick_;
         }
 
         ecrt_domain_queue(domain_);

@@ -13,7 +13,6 @@ class QPlainTextEdit;
 class QTimer;
 class QTabWidget;
 class QCheckBox;
-class QListWidget;
 
 /* 每个电机 Tab 所用控件集合 */
 struct MotorPanel {
@@ -77,20 +76,11 @@ private slots:
     void onBrakeOpen(int motor);
     void onBrakeClose(int motor);
     void onBrakeQuery(int motor);
-    void onRecordToggle();
-    void onPlayMotion();
-    void onStopMotion();
-    void onDeleteMotion();
-    void onMotionRecorded(RecordedMotion motion);
-    void onMotionState(const QString &state);
 
 private:
     void buildUi();
     void rebuildMotorTabs(int n);
     void appendLog(const QString &m);
-    void loadMotionLibrary();
-    bool saveMotionLibrary();
-    void refreshMotionList();
 
     /* 顶部配置 */
     QSpinBox    *spSlaves_;
@@ -109,12 +99,4 @@ private:
     QVector<MotorPanel>  panels_;
     QVector<bool>        motorMask_;   // 扫描后每个总线位置是否为电机
     bool                 running_ = false;
-
-    QListWidget  *motionList_;
-    QSpinBox     *spRecordMs_, *spReturnSpeed_;
-    QPushButton  *btnRecord_, *btnPlay_, *btnMotionStop_, *btnMotionDelete_;
-    QLabel       *lblMotionState_;
-    struct SavedMotion { QString name, created; RecordedMotion data; };
-    QVector<SavedMotion> motions_;
-    bool recording_ = false;
 };

@@ -23,15 +23,6 @@
 #include <QScrollArea>
 #include <QGridLayout>
 #include <QStyle>
-#include <QListWidget>
-#include <QInputDialog>
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QJsonArray>
-#include <QFile>
-#include <QSaveFile>
-#include <QDir>
-#include <QStandardPaths>
 #include <climits>
 
 extern "C" {
@@ -68,9 +59,7 @@ static QString swText(uint16_t sw) {
 
 /* ---------------------------------------------------------------- */
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
-    qRegisterMetaType<RecordedMotion>("RecordedMotion");
     buildUi();
-    loadMotionLibrary();
     rebuildMotorTabs(spSlaves_->value());
 
     timer_ = new QTimer(this);
@@ -186,33 +175,6 @@ void MainWindow::buildUi() {
     splitter->setStretchFactor(1, 1);   // 日志默认占 1/4
 
     root->addWidget(gbTop);
-
-    /* ========= 机械臂动作示教 ========= */
-
-    auto *gbMotion = new QGroupBox("机械臂动作录制与播放", central);
-    auto *motionLay = new QGridLayout(gbMotion);
-    motionList_ = new QListWidget;
-    motionList_->setMaximumHeight(92);
-    motionList_->setToolTip("已保存动作（名称 / 帧数 / 时长）");
-    spRecordMs_ = new QSpinBox; spRecordMs_->setRange(5, 200); spRecordMs_->setValue(20); spRecordMs_->setSuffix(" ms");
-    spReturnSpeed_ = new QSpinBox; spReturnSpeed_->setRange(100, INT_MAX); spReturnSpeed_->setValue(100000); spReturnSpeed_->setSuffix(" 脉冲/s");
-    btnRecord_ = new QPushButton("开始录制（失能）");
-    btnPlay_ = new QPushButton("回起点并播放");
-    btnMotionStop_ = new QPushButton("停止动作");
-    btnMotionDelete_ = new QPushButton("删除所选");
-    lblMotionState_ = new QLabel("空闲");
-    motionLay->addWidget(motionList_, 0, 0, 3, 1);
-    motionLay->addWidget(new QLabel("采样周期:"), 0, 1); motionLay->addWidget(spRecordMs_, 0, 2);
-    motionLay->addWidget(new QLabel("回起点速度:"), 1, 1); motionLay->addWidget(spReturnSpeed_, 1, 2);
-    motionLay->addWidget(btnRecord_, 0, 3); motionLay->addWidget(btnPlay_, 0, 4);
-    motionLay->addWidget(btnMotionStop_, 1, 3); motionLay->addWidget(btnMotionDelete_, 1, 4);
-    motionLay->addWidget(new QLabel("状态:"), 2, 1); motionLay->addWidget(lblMotionState_, 2, 2, 1, 3);
-    motionLay->setColumnStretch(0, 1);
-    connect(btnRecord_, &QPushButton::clicked, this, &MainWindow::onRecordToggle);
-    connect(btnPlay_, &QPushButton::clicked, this, &MainWindow::onPlayMotion);
-    connect(btnMotionStop_, &QPushButton::clicked, this, &MainWindow::onStopMotion);
-    connect(btnMotionDelete_, &QPushButton::clicked, this, &MainWindow::onDeleteMotion);
-    root->addWidget(gbMotion);
     root->addWidget(splitter, 1);
 
     setCentralWidget(central);
@@ -520,8 +482,6 @@ void MainWindow::onStart() {
     connect(worker_, &EcWorker::masterStarted, this, &MainWindow::onMasterStarted);
     connect(worker_, &EcWorker::masterStopped, this, &MainWindow::onMasterStopped);
     connect(worker_, &EcWorker::sdoFinished,   this, &MainWindow::onSdoResult);
-    connect(worker_, &EcWorker::motionRecordFinished, this, &MainWindow::onMotionRecorded);
-    connect(worker_, &EcWorker::motionStateChanged, this, &MainWindow::onMotionState);
 
     appendLog(QString("启动 EtherCAT：%1 从站, 周期 %2us").arg(cfg.slaveCount).arg(cfg.cycleUs));
     btnStart_->setEnabled(false);
@@ -552,7 +512,6 @@ void MainWindow::onMasterStarted() {
 
 void MainWindow::onMasterStopped() {
     running_ = false;
-    recording_ = false;
     timer_->stop();
     btnStart_->setEnabled(true);
     btnStop_->setEnabled(false);
@@ -565,139 +524,7 @@ void MainWindow::onMasterStopped() {
     spCycleUs_->setEnabled(true);
     lblMasterState_->setText("● 已停止");
     lblMasterState_->setStyleSheet("color:gray;font-weight:bold;");
-    if (lblMotionState_) lblMotionState_->setText("主站已停止");
-    if (btnRecord_) { btnRecord_->setText("开始录制（失能）"); btnRecord_->setEnabled(true); }
-    if (btnPlay_) btnPlay_->setEnabled(true);
-    if (tabs_) tabs_->setEnabled(true);
     appendLog("主站已停止");
-}
-
-/* ================= 机械臂动作库 ================= */
-static QString motionLibraryPath() {
-    QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-    QDir().mkpath(dir);
-    return dir + "/robot_motions.json";
-}
-
-void MainWindow::loadMotionLibrary() {
-    motions_.clear();
-    QFile f(motionLibraryPath());
-    if (!f.exists()) { refreshMotionList(); return; }
-    if (!f.open(QIODevice::ReadOnly)) { appendLog("<警告> 无法读取动作库: " + f.errorString()); return; }
-    QJsonParseError pe;
-    QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &pe);
-    if (pe.error != QJsonParseError::NoError || !doc.isObject()) {
-        appendLog("<警告> 动作库 JSON 损坏: " + pe.errorString()); return;
-    }
-    for (const QJsonValue &v : doc.object().value("motions").toArray()) {
-        QJsonObject o = v.toObject(); SavedMotion m;
-        m.name = o.value("name").toString().trimmed();
-        m.created = o.value("created").toString();
-        m.data.sampleMs = o.value("sample_ms").toInt(20);
-        int axes = o.value("axes").toInt();
-        for (const QJsonValue &fv : o.value("frames").toArray()) {
-            QVector<int32_t> frame;
-            for (const QJsonValue &p : fv.toArray()) frame.push_back((int32_t)p.toDouble());
-            if (axes > 0 && frame.size() == axes) m.data.frames.push_back(frame);
-        }
-        if (!m.name.isEmpty() && m.data.frames.size() >= 2) motions_.push_back(m);
-    }
-    refreshMotionList();
-    appendLog(QString("已加载 %1 条机械臂动作: %2").arg(motions_.size()).arg(motionLibraryPath()));
-}
-
-bool MainWindow::saveMotionLibrary() {
-    QJsonArray list;
-    for (const SavedMotion &m : motions_) {
-        QJsonObject o; o["name"] = m.name; o["created"] = m.created;
-        o["sample_ms"] = m.data.sampleMs;
-        o["axes"] = m.data.frames.isEmpty() ? 0 : m.data.frames.first().size();
-        QJsonArray frames;
-        for (const auto &f : m.data.frames) {
-            QJsonArray a; for (int32_t p : f) a.append((double)p); frames.append(a);
-        }
-        o["frames"] = frames; list.append(o);
-    }
-    QJsonObject root; root["version"] = 1; root["motions"] = list;
-    QSaveFile f(motionLibraryPath());
-    if (!f.open(QIODevice::WriteOnly) || f.write(QJsonDocument(root).toJson()) < 0 || !f.commit()) {
-        QMessageBox::warning(this, "动作库", "保存失败: " + f.errorString()); return false;
-    }
-    return true;
-}
-
-void MainWindow::refreshMotionList() {
-    if (!motionList_) return;
-    int row = motionList_->currentRow(); motionList_->clear();
-    for (const SavedMotion &m : motions_) {
-        double seconds = (m.data.frames.size() - 1) * m.data.sampleMs / 1000.0;
-        motionList_->addItem(QString("%1  |  %2 帧 / %3 s")
-            .arg(m.name).arg(m.data.frames.size()).arg(seconds, 0, 'f', 2));
-    }
-    if (!motions_.isEmpty()) motionList_->setCurrentRow(qBound(0, row, motions_.size() - 1));
-}
-
-void MainWindow::onRecordToggle() {
-    if (!worker_ || !running_) { QMessageBox::information(this, "动作录制", "请先启动 EtherCAT 主站"); return; }
-    if (!recording_) {
-        if (!worker_->beginMotionRecord(spRecordMs_->value())) {
-            QMessageBox::warning(this, "动作录制", "无法开始：已有录制或播放任务"); return;
-        }
-        recording_ = true; btnRecord_->setText("停止录制并保存");
-        tabs_->setEnabled(false); btnPlay_->setEnabled(false); btnSdoSafe_->setEnabled(false);
-        appendLog(QString("开始动作录制，采样周期 %1 ms；所有电机保持失能").arg(spRecordMs_->value()));
-    } else worker_->endMotionRecord();
-}
-
-void MainWindow::onMotionRecorded(RecordedMotion motion) {
-    recording_ = false; btnRecord_->setText("开始录制（失能）");
-    tabs_->setEnabled(true); btnPlay_->setEnabled(true); btnSdoSafe_->setEnabled(running_);
-    if (motion.frames.size() < 2) { QMessageBox::warning(this, "动作录制", "有效采样不足 2 帧，未保存"); return; }
-    bool ok = false;
-    QString name = QInputDialog::getText(this, "保存动作", "动作名称:", QLineEdit::Normal, QString(), &ok).trimmed();
-    if (!ok || name.isEmpty()) { appendLog("动作录制已取消保存"); return; }
-    int existing = -1;
-    for (int i = 0; i < motions_.size(); ++i) if (motions_[i].name == name) { existing = i; break; }
-    if (existing >= 0 && QMessageBox::question(this, "覆盖动作", "名称已存在，是否覆盖？") != QMessageBox::Yes) return;
-    SavedMotion m{name, QDateTime::currentDateTime().toString(Qt::ISODate), motion};
-    if (existing >= 0) motions_[existing] = m; else motions_.push_back(m);
-    if (saveMotionLibrary()) {
-        refreshMotionList(); motionList_->setCurrentRow(existing >= 0 ? existing : motions_.size() - 1);
-        appendLog(QString("动作“%1”已保存：%2 帧，%3 ms/帧").arg(name).arg(motion.frames.size()).arg(motion.sampleMs));
-    }
-}
-
-void MainWindow::onPlayMotion() {
-    int row = motionList_->currentRow();
-    if (!worker_ || !running_) { QMessageBox::information(this, "动作播放", "请先启动 EtherCAT 主站"); return; }
-    if (worker_->sdoSafeMode()) { QMessageBox::information(this, "动作播放", "请先退出 SDO 调参模式"); return; }
-    if (row < 0 || row >= motions_.size()) { QMessageBox::information(this, "动作播放", "请选择一条动作"); return; }
-    const RecordedMotion &m = motions_[row].data;
-    if (m.frames.first().size() != spSlaves_->value()) { QMessageBox::warning(this, "动作播放", "动作轴数与当前从站数不匹配"); return; }
-    for (const MotorStatus &s : worker_->snapshot()) if (s.isMotor && ((s.statusWord & (1 << 3)) || s.errorCode)) {
-        QMessageBox::warning(this, "动作播放", "存在电机故障，请复位后再播放"); return;
-    }
-    if (!worker_->beginMotionPlayback(m, spReturnSpeed_->value())) {
-        QMessageBox::warning(this, "动作播放", "无法播放：当前已有动作任务或轨迹无效"); return;
-    }
-    tabs_->setEnabled(false); btnRecord_->setEnabled(false); btnSdoSafe_->setEnabled(false);
-    appendLog(QString("播放动作“%1”：先以 %2 脉冲/s 回到起点").arg(motions_[row].name).arg(spReturnSpeed_->value()));
-}
-
-void MainWindow::onStopMotion() { if (worker_) worker_->stopMotionActivity(); }
-
-void MainWindow::onDeleteMotion() {
-    int row = motionList_->currentRow(); if (row < 0 || row >= motions_.size()) return;
-    if (QMessageBox::question(this, "删除动作", "确定删除“" + motions_[row].name + "”？") != QMessageBox::Yes) return;
-    motions_.removeAt(row); if (saveMotionLibrary()) refreshMotionList();
-}
-
-void MainWindow::onMotionState(const QString &state) {
-    lblMotionState_->setText(state); appendLog("机械臂动作状态: " + state);
-    if (state == "空闲" || state == "播放完成") {
-        tabs_->setEnabled(true); btnRecord_->setEnabled(true); btnPlay_->setEnabled(true);
-        btnSdoSafe_->setEnabled(running_);
-    }
 }
 
 void MainWindow::onToggleSdoSafe(bool on) {
