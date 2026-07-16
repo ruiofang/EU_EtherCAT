@@ -29,10 +29,14 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QFile>
+#include <QFileInfo>
 #include <QSaveFile>
 #include <QDir>
 #include <QStandardPaths>
+#include <QSettings>
 #include <climits>
+#include <sys/stat.h>
+#include <unistd.h>
 
 extern "C" {
 #include <ecrt.h>
@@ -68,10 +72,27 @@ static QString swText(uint16_t sw) {
 
 static MotorCommand buildCmdFromPanel(const MotorPanel &p);
 
+static QString settingsFilePath() {
+    return QApplication::applicationDirPath() + "/EU_robot_arm_gui.conf";
+}
+
+/* sudo 运行时，把程序生成的文件交还给发起 sudo 的桌面用户，避免随后
+   以普通用户编译、查看或修改配置时遇到 root:root 权限问题。 */
+static void restoreSudoUserOwnership(const QString &path) {
+    bool uidOk = false, gidOk = false;
+    const uint uid = qEnvironmentVariableIntValue("SUDO_UID", &uidOk);
+    const uint gid = qEnvironmentVariableIntValue("SUDO_GID", &gidOk);
+    if (!uidOk || !gidOk) return;
+    const QByteArray nativePath = QFile::encodeName(path);
+    ::chown(nativePath.constData(), static_cast<uid_t>(uid), static_cast<gid_t>(gid));
+    ::chmod(nativePath.constData(), QFileInfo(path).isDir() ? 0775 : 0664);
+}
+
 /* ---------------------------------------------------------------- */
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     qRegisterMetaType<RecordedMotion>("RecordedMotion");
     buildUi();
+    setLogSaving(chkSaveLog_->isChecked());
     loadMotionLibrary();
     rebuildMotorTabs(spSlaves_->value());
 
@@ -91,6 +112,10 @@ MainWindow::~MainWindow() {
         worker_->wait();
         delete worker_;
         worker_ = nullptr;
+    }
+    if (logFile_) {
+        logFile_->flush();
+        logFile_->close();
     }
 }
 
@@ -145,6 +170,12 @@ void MainWindow::buildUi() {
     btnScan_ = new QPushButton("扫描从站");
     btnScan_->setToolTip("检测总线上在线的从站数量和 vendor/product，自动填入并重建电机面板");
 
+    chkSaveLog_ = new QCheckBox("保存日志");
+    QSettings settings(settingsFilePath(), QSettings::IniFormat);
+    chkSaveLog_->setChecked(settings.value("saveLog", true).toBool());
+    restoreSudoUserOwnership(settingsFilePath());
+    chkSaveLog_->setToolTip("保存到可执行文件所在目录的 log 文件夹；切换开启时生成新日志文件");
+
     /* 第 0 行：参数 */
     top->addWidget(new QLabel("从站数:"), 0, 0); top->addWidget(spSlaves_,  0, 1);
     top->addWidget(new QLabel("Vendor:"),  0, 2); top->addWidget(edVendor_,  0, 3);
@@ -155,7 +186,8 @@ void MainWindow::buildUi() {
     top->addWidget(btnStart_,       1, 2);
     top->addWidget(btnStop_,        1, 3);
     top->addWidget(btnSdoSafe_,     1, 4, 1, 2);
-    top->addWidget(lblMasterState_, 1, 6, 1, 2);
+    top->addWidget(chkSaveLog_,      1, 6);
+    top->addWidget(lblMasterState_,  1, 7);
     top->setColumnStretch(7, 1);
 
     connect(spSlaves_, QOverload<int>::of(&QSpinBox::valueChanged),
@@ -164,6 +196,13 @@ void MainWindow::buildUi() {
     connect(btnStop_,  &QPushButton::clicked, this, &MainWindow::onStop);
     connect(btnSdoSafe_, &QPushButton::toggled, this, &MainWindow::onToggleSdoSafe);
     connect(btnScan_,  &QPushButton::clicked, this, &MainWindow::onScan);
+    connect(chkSaveLog_, &QCheckBox::toggled, this, [this](bool enabled) {
+        QSettings settings(settingsFilePath(), QSettings::IniFormat);
+        settings.setValue("saveLog", enabled);
+        settings.sync();
+        restoreSudoUserOwnership(settingsFilePath());
+        setLogSaving(enabled);
+    });
 
     /* ========= 中/下：用 Splitter 让用户按屏幕自由分配 ========= */
     auto *splitter = new QSplitter(Qt::Vertical, central);
@@ -405,8 +444,45 @@ void MainWindow::rebuildMotorTabs(int n) {
 
 /* ---------------------------------------------------------------- */
 void MainWindow::appendLog(const QString &m) {
-    log_->appendPlainText(QString("[%1] %2")
-        .arg(QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss.zzz")).arg(m));
+    const QString line = QString("[%1] %2")
+        .arg(QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss.zzz")).arg(m);
+    log_->appendPlainText(line);
+    if (logFile_ && logFile_->isOpen()) {
+        logFile_->write((line + '\n').toUtf8());
+        /* EtherCAT/程序异常退出时也尽量保留最后几条诊断信息。 */
+        logFile_->flush();
+    }
+}
+
+void MainWindow::setLogSaving(bool enabled) {
+    if (!enabled) {
+        if (logFile_) {
+            logFile_->flush();
+            logFile_->close();
+            delete logFile_;
+            logFile_ = nullptr;
+        }
+        return;
+    }
+    if (logFile_ && logFile_->isOpen()) return;
+
+    const QString logDirPath = QApplication::applicationDirPath() + "/log";
+    if (!QDir().mkpath(logDirPath)) {
+        appendLog("<警告> 无法创建日志目录: " + logDirPath);
+        return;
+    }
+    restoreSudoUserOwnership(logDirPath);
+    const QString fileName = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss_zzz") + ".log";
+    logFile_ = new QFile(logDirPath + "/" + fileName, this);
+    if (!logFile_->open(QIODevice::WriteOnly | QIODevice::Text)) {
+        const QString err = logFile_->errorString();
+        delete logFile_;
+        logFile_ = nullptr;
+        appendLog("<警告> 日志文件打开失败: " + err);
+        return;
+    }
+    restoreSudoUserOwnership(logFile_->fileName());
+    appendLog("日志文件: " + logFile_->fileName());
 }
 
 void MainWindow::onLog(const QString &m)   { appendLog(m); }

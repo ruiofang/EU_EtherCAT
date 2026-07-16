@@ -14,6 +14,7 @@ class QTimer;
 class QTabWidget;
 class QCheckBox;
 class QListWidget;
+class QFile;
 
 /* 每个电机 Tab 所用控件集合 */
 struct MotorPanel {
@@ -93,6 +94,7 @@ private:
     void buildUi();
     void rebuildMotorTabs(int n);
     void appendLog(const QString &m);
+    void setLogSaving(bool enabled);
     void loadMotionLibrary();
     bool saveMotionLibrary();
     void refreshMotionList();
@@ -107,10 +109,12 @@ private:
     QLabel      *lblMasterState_;
     QPushButton *btnSdoSafe_;
     QPushButton *btnScan_;
+    QCheckBox   *chkSaveLog_;
 
     QTabWidget     *tabs_;
     QPlainTextEdit *log_;
     QTimer         *timer_;
+    QFile          *logFile_ = nullptr;
 
     EcWorker            *worker_ = nullptr;
     QVector<MotorPanel>  panels_;

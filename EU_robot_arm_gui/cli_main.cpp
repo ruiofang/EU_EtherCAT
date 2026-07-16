@@ -4,10 +4,12 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSaveFile>
+#include <QSettings>
 #include <QSocketNotifier>
 #include <QStandardPaths>
 #include <QTextStream>
@@ -15,6 +17,8 @@
 #include <QTimer>
 
 #include <cstdio>
+#include <sys/stat.h>
+#include <unistd.h>
 
 extern "C" {
 #include <ecrt.h>
@@ -22,11 +26,23 @@ extern "C" {
 
 struct CliMotion { QString name, created; RecordedMotion data; };
 
+static void restoreSudoUserOwnership(const QString &path) {
+    bool uidOk = false, gidOk = false;
+    const uint uid = qEnvironmentVariableIntValue("SUDO_UID", &uidOk);
+    const uint gid = qEnvironmentVariableIntValue("SUDO_GID", &gidOk);
+    if (!uidOk || !gidOk) return;
+    const QByteArray nativePath = QFile::encodeName(path);
+    ::chown(nativePath.constData(), static_cast<uid_t>(uid), static_cast<gid_t>(gid));
+    ::chmod(nativePath.constData(), QFileInfo(path).isDir() ? 0775 : 0664);
+}
+
 class CliController : public QObject {
 public:
     explicit CliController(QObject *parent = nullptr) : QObject(parent), input_(fileno(stdin), QSocketNotifier::Read, this) {
+        initLogFile();
         connect(&input_, &QSocketNotifier::activated, this, [this] { readCommand(); });
         /* CLI 默认静默运行：不转发周期诊断等普通日志，避免刷屏和终端 I/O 抢占。 */
+        connect(&worker_, &EcWorker::logMessage, this, [this](const QString &s) { logOnly(s); });
         connect(&worker_, &EcWorker::errorOccurred, this, [this](const QString &s) { out("[错误] " + s); });
         connect(&worker_, &EcWorker::masterStarted, this, [this] {
             running_ = true;
@@ -34,7 +50,11 @@ public:
             out("主站已启动：已自动请求使能全部 EU 电机（CSP 当前位置保持）");
             showMenu();
         });
-        connect(&worker_, &EcWorker::masterStopped, this, [this] { running_ = false; out("主站已停止"); });
+        connect(&worker_, &EcWorker::masterStopped, this, [this] {
+            running_ = false;
+            out("主站已停止");
+            if (exiting_) QCoreApplication::quit();
+        });
         connect(&worker_, &EcWorker::motionStateChanged, this, [this](const QString &s) {
             motionState_ = s; out("[动作] " + s);
             if (s == "已到起点" && autoPlay_) { autoPlay_ = false; worker_.startPreparedMotionPlayback(); }
@@ -51,9 +71,45 @@ public:
     ~CliController() override { worker_.requestStop(); worker_.wait(); }
 
 private:
+    void initLogFile() {
+        const QString appDir = QCoreApplication::applicationDirPath();
+        const QString settingsPath = appDir + "/EU_robot_arm_gui.conf";
+        QSettings settings(settingsPath, QSettings::IniFormat);
+        restoreSudoUserOwnership(settingsPath);
+        if (!settings.value("saveLog", true).toBool()) return;
+
+        const QString logDir = appDir + "/log";
+        if (!QDir().mkpath(logDir)) {
+            out("[警告] 无法创建日志目录：" + logDir);
+            return;
+        }
+        restoreSudoUserOwnership(logDir);
+        const QString name = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss_zzz") + "_cli.log";
+        logFile_.setFileName(logDir + "/" + name);
+        if (!logFile_.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            const QString error = logFile_.errorString();
+            logFile_.setFileName(QString());
+            out("[警告] CLI 日志文件打开失败：" + error);
+            return;
+        }
+        restoreSudoUserOwnership(logFile_.fileName());
+        out("CLI 日志文件：" + logFile_.fileName());
+    }
+
     void out(const QString &s) {
+        const QString line = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss.zzz ") + s;
         QTextStream ts(stdout); ts.setCodec("UTF-8");
-        ts << QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss.zzz ") << s << Qt::endl;
+        ts << line << Qt::endl;
+        if (logFile_.isOpen()) {
+            logFile_.write((line + '\n').toUtf8());
+            logFile_.flush();
+        }
+    }
+    void logOnly(const QString &s) {
+        if (!logFile_.isOpen()) return;
+        const QString line = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss.zzz ") + s;
+        logFile_.write((line + '\n').toUtf8());
+        logFile_.flush();
     }
     void prompt(const QString &s = "请选择> ") {
         QTextStream ts(stdout); ts.setCodec("UTF-8"); ts << s << Qt::flush;
@@ -68,14 +124,13 @@ private:
                " 3. 全部使能\n"
                " 4. 一键故障复位\n"
                " 5. 全部失能并松开抱闸\n"
-               " 6. 全部失能并抱闸\n"
-               " 7. 开始录制\n"
-               " 8. 停止录制并命名保存\n"
-               " 9. 回到动作起点\n"
-               "10. 播放（需先到起点）\n"
-               "11. 回起点并播放\n"
-               "12. 停止当前动作\n"
-               "13. 设置采样周期/回起点速度\n"
+               " 6. 开始录制\n"
+               " 7. 停止录制并命名保存\n"
+               " 8. 回到动作起点\n"
+               " 9. 播放（需先到起点）\n"
+               "10. 回起点并播放\n"
+               "11. 停止当前动作\n"
+               "12. 设置采样周期/回起点速度\n"
                " 0. 退出\n")
            << QString("当前设置：采样=%1 ms，回起点速度=%2 脉冲/s\n").arg(recordMs_).arg(returnSpeed_)
            << QStringLiteral("====================================\n");
@@ -272,25 +327,33 @@ private:
         } else if (choice == 3) setEnableAll(true);
         else if (choice == 4) resetFaults();
         else if (choice == 5) { worker_.stopMotionActivity(); setEnableAll(false); QTimer::singleShot(100, this, [this]{ writeBrakes(true); }); }
-        else if (choice == 6) { setEnableAll(false); QTimer::singleShot(100, this, [this]{ writeBrakes(false); }); }
-        else if (choice == 7) {
+        else if (choice == 6) {
             setEnableAll(false); writeBrakes(true);
             QTimer::singleShot(150, this, [this]{ if (!worker_.beginMotionRecord(recordMs_)) out("无法开始录制"); });
-        } else if (choice == 8) { inputMode_ = RecordNameInput; prompt("请输入动作名称> "); return;
-        } else if (choice == 9) { inputMode_ = ReturnMotionInput; showMotionChoices(); return;
-        } else if (choice == 10) { if (!worker_.startPreparedMotionPlayback()) out("请先选择 9 回起点，并等待状态显示已到起点"); }
-        else if (choice == 11) { inputMode_ = RunMotionInput; showMotionChoices(); return;
-        } else if (choice == 12) { autoPlay_ = false; worker_.stopMotionActivity(); QTimer::singleShot(100, this, [this]{ writeBrakes(false); }); }
-        else if (choice == 13) { inputMode_ = SettingsInput; prompt("输入：采样周期ms 回起点速度（例如 20 50000）> "); return;
-        } else if (choice == 0) { worker_.requestStop(); worker_.wait(); QCoreApplication::quit(); return; }
+        } else if (choice == 7) { inputMode_ = RecordNameInput; prompt("请输入动作名称> "); return;
+        } else if (choice == 8) { inputMode_ = ReturnMotionInput; showMotionChoices(); return;
+        } else if (choice == 9) { if (!worker_.startPreparedMotionPlayback()) out("请先选择 8 回起点，并等待状态显示已到起点"); }
+        else if (choice == 10) { inputMode_ = RunMotionInput; showMotionChoices(); return;
+        } else if (choice == 11) { autoPlay_ = false; worker_.stopMotionActivity(); QTimer::singleShot(100, this, [this]{ writeBrakes(false); }); }
+        else if (choice == 12) { inputMode_ = SettingsInput; prompt("输入：采样周期ms 回起点速度（例如 20 50000）> "); return;
+        } else if (choice == 0) {
+            exiting_ = true;
+            input_.setEnabled(false);
+            out("正在停止主站，请等待当前 SDO 请求结束...");
+            worker_.requestStop();
+            /* 保持 CLI 事件循环运行，以便处理 SDO 收尾日志和 masterStopped。 */
+            if (!worker_.isRunning()) QCoreApplication::quit();
+            return;
+        }
         else out("菜单编号无效");
         showMenu();
     }
 
     EcWorker worker_;
+    QFile logFile_;
     QSocketNotifier input_;
     QVector<CliMotion> motions_;
-    bool running_ = false, autoPlay_ = false;
+    bool running_ = false, autoPlay_ = false, exiting_ = false;
     QString motionState_ = "空闲", pendingRecordName_;
     enum InputMode { MenuInput, RecordNameInput, ReturnMotionInput, RunMotionInput, SettingsInput };
     InputMode inputMode_ = MenuInput;
@@ -304,6 +367,9 @@ int main(int argc, char **argv) {
     QCoreApplication app(argc, argv);
     QCoreApplication::setOrganizationName("");
     QCoreApplication::setApplicationName("EU_robot_arm_gui"); // 与 GUI 共用动作库目录
+    /* EcWorker 在独立线程发出这些信号，CLI 也必须注册队列连接参数。 */
+    qRegisterMetaType<SdoResult>("SdoResult");
+    qRegisterMetaType<MotorStatus>("MotorStatus");
     qRegisterMetaType<RecordedMotion>("RecordedMotion");
     CliController controller;
     return app.exec();
