@@ -62,6 +62,7 @@ public:
         connect(&worker_, &EcWorker::motionRecordFinished, this, [this](const RecordedMotion &m) { saveRecorded(m); });
         connect(&worker_, &EcWorker::sdoFinished, this, [this](const SdoResult &r) {
             if (!r.ok) out(QString("[SDO失败] %1 %2").arg(r.tag, r.err));
+            handleBrakeSdoResult(r);
         });
         loadMotions();
         QTimer::singleShot(0, this, [this] { startMaster(); });
@@ -70,6 +71,8 @@ public:
     ~CliController() override { worker_.requestStop(); worker_.wait(); }
 
 private:
+    enum PendingBrakeAction { NoBrakeAction, FreeOnly, StartRecord, StartReturn };
+
     void initLogFile() {
         const QString appDir = QCoreApplication::applicationDirPath();
         const QString settingsPath = appDir + "/EU_robot_arm_gui.conf";
@@ -235,14 +238,62 @@ private:
         out(QString("已向 %1 个 EU 电机发送 Controlword 0x0080 故障复位脉冲").arg(count));
     }
 
-    void writeBrakes(bool open) {
+    int writeBrakes(bool open, const QString &tagPrefix = "CLI-BRAKE") {
         auto s = worker_.snapshot();
+        int count = 0;
         for (int i = 0; i < s.size(); ++i) if (s[i].isMotor) {
             SdoJob j; j.slave = i; j.index = 0x2014; j.subindex = 1; j.bits = 8;
-            j.write = true; j.value = open ? 1 : 0; j.tag = QString("CLI-BRAKE-%1-%2").arg(i).arg(open);
-            worker_.postSdo(j);
+            j.write = true; j.value = open ? 1 : 0;
+            j.tag = QString("%1/M%2/%3").arg(tagPrefix).arg(i).arg(open ? "open" : "close");
+            worker_.postSdo(j); ++count;
         }
         out(open ? "已请求松开全部抱闸" : "已请求抱死全部抱闸");
+        return count;
+    }
+
+    void beginBrakePreparation(PendingBrakeAction action) {
+        if (pendingBrakeCount_ > 0) {
+            out("[警告] 已有抱闸写入操作正在进行，请稍后重试");
+            return;
+        }
+        pendingBrakeAction_ = action;
+        failedBrakeCount_ = 0;
+        pendingBrakeCount_ = writeBrakes(true, "CLI-PREP-BRAKE");
+        if (pendingBrakeCount_ == 0) finishBrakePreparation();
+    }
+
+    void handleBrakeSdoResult(const SdoResult &r) {
+        if (!r.tag.startsWith("CLI-PREP-BRAKE/")) return;
+        if (!r.ok) ++failedBrakeCount_;
+        if (pendingBrakeCount_ > 0) --pendingBrakeCount_;
+        if (pendingBrakeCount_ == 0) finishBrakePreparation();
+    }
+
+    void finishBrakePreparation() {
+        const PendingBrakeAction action = pendingBrakeAction_;
+        pendingBrakeAction_ = NoBrakeAction;
+        if (failedBrakeCount_ > 0) {
+            out(QString("[安全警告] 有 %1 个电机写入 0x2014:01 失败；"
+                        "程序按兼容/未知模式继续。请确认相关电机没有物理抱闸，或抱闸已经安全松开。")
+                    .arg(failedBrakeCount_));
+        } else {
+            out("抱闸松开写入尝试全部完成");
+        }
+
+        if (action == FreeOnly) {
+            out(QString("全部电机已失能；抱闸写入失败 %1 个，兼容流程完成").arg(failedBrakeCount_));
+        } else if (action == StartRecord) {
+            if (!worker_.beginMotionRecord(recordMs_)) out("无法开始录制");
+            else out(QString("抱闸写入尝试完成（失败 %1 个），开始录制").arg(failedBrakeCount_));
+        } else if (action == StartReturn) {
+            if (!worker_.beginMotionReturnToStart(pendingReturnMotion_, pendingReturnSpeed_)) {
+                autoPlay_ = false;
+                out("无法启动回起点任务");
+            } else {
+                out(QString("抱闸写入尝试完成（失败 %1 个），开始回起点").arg(failedBrakeCount_));
+            }
+            pendingReturnMotion_ = RecordedMotion{};
+        }
     }
 
     void returnMotion(const QString &name, int speed, bool autoPlay) {
@@ -272,13 +323,9 @@ private:
         }
 
         setEnableAll(false);
-        writeBrakes(true);
-        QTimer::singleShot(150, this, [this, motion, speed] {
-            if (!worker_.beginMotionReturnToStart(motion, speed)) {
-                autoPlay_ = false;
-                out("无法启动回起点任务");
-            }
-        });
+        pendingReturnMotion_ = motion;
+        pendingReturnSpeed_ = speed;
+        beginBrakePreparation(StartReturn);
     }
 
     void saveRecorded(const RecordedMotion &motion) {
@@ -331,10 +378,13 @@ private:
             for (const auto &m : motions_) out(QString("%1  %2帧  %3ms/帧").arg(m.name).arg(m.data.frames.size()).arg(m.data.sampleMs));
         } else if (choice == 3) setEnableAll(true);
         else if (choice == 4) resetFaults();
-        else if (choice == 5) { worker_.stopMotionActivity(); setEnableAll(false); QTimer::singleShot(100, this, [this]{ writeBrakes(true); }); }
+        else if (choice == 5) {
+            worker_.stopMotionActivity(); setEnableAll(false);
+            QTimer::singleShot(100, this, [this]{ beginBrakePreparation(FreeOnly); });
+        }
         else if (choice == 6) {
-            setEnableAll(false); writeBrakes(true);
-            QTimer::singleShot(150, this, [this]{ if (!worker_.beginMotionRecord(recordMs_)) out("无法开始录制"); });
+            setEnableAll(false);
+            QTimer::singleShot(100, this, [this]{ beginBrakePreparation(StartRecord); });
         } else if (choice == 7) { inputMode_ = RecordNameInput; prompt("请输入动作名称> "); return;
         } else if (choice == 8) { inputMode_ = ReturnMotionInput; showMotionChoices(); return;
         } else if (choice == 9) { if (!worker_.startPreparedMotionPlayback()) out("请先选择 8 回起点，并等待状态显示已到起点"); }
@@ -360,6 +410,11 @@ private:
     QVector<CliMotion> motions_;
     bool running_ = false, autoPlay_ = false, exiting_ = false;
     QString motionState_ = "空闲", pendingRecordName_;
+    PendingBrakeAction pendingBrakeAction_ = NoBrakeAction;
+    int pendingBrakeCount_ = 0;
+    int failedBrakeCount_ = 0;
+    RecordedMotion pendingReturnMotion_;
+    int pendingReturnSpeed_ = 100000;
     enum InputMode { MenuInput, RecordNameInput, ReturnMotionInput, RunMotionInput, SettingsInput };
     InputMode inputMode_ = MenuInput;
     int recordMs_ = 20;

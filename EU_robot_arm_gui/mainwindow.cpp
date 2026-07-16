@@ -831,10 +831,11 @@ void MainWindow::onDisableReleaseAll() {
     playbackPreparing_ = false;
     worker_->stopMotionActivity();
     setAllMotorCommandsDisabled();
+    pendingFreeBrakes_ = 0;
+    failedFreeBrakes_ = 0;
     lblMotionState_->setText("正在失能并松开抱闸...");
     QTimer::singleShot(100, this, [this] {
         writeAllBrakes(true, "WFREEBRK");
-        lblMotionState_->setText("已失能并请求松开抱闸");
         appendLog("机械臂：所有电机已失能，并请求松开全部抱闸");
     });
 }
@@ -993,6 +994,10 @@ void MainWindow::writeAllBrakes(bool open, const QString &tagPrefix) {
             btnSdoSafe_->setEnabled(running_);
             QMessageBox::warning(this, "动作播放", "没有识别到可松闸的 EU 电机");
         }
+    } else if (tagPrefix == "WFREEBRK") {
+        pendingFreeBrakes_ = count;
+        if (count == 0)
+            lblMotionState_->setText("已失能（没有识别到 EU 电机）");
     }
 }
 
@@ -1239,30 +1244,52 @@ void MainWindow::onSdoResult(SdoResult r) {
         : QString("失败: %1").arg(r.err);
     appendLog(QString("[SDO %1] %2").arg(r.tag).arg(txt));
 
-    /* 录制准备流程：只有全部电机确认松闸写入成功后才开始位置采样。 */
+    /* 独立“失能并松开抱闸”：写失败只汇总告警，不影响失能及后续操作。 */
+    if (r.tag.startsWith("WFREEBRK/")) {
+        if (!r.ok) ++failedFreeBrakes_;
+        if (pendingFreeBrakes_ > 0) --pendingFreeBrakes_;
+        if (pendingFreeBrakes_ == 0) {
+            if (failedFreeBrakes_ > 0) {
+                lblMotionState_->setText(
+                    QString("已失能；松闸写入失败 %1 个（兼容继续）").arg(failedFreeBrakes_));
+                appendLog(QString("<警告> 已完成电机失能；有 %1 个电机写入 0x2014:01 失败，按无抱闸兼容继续")
+                    .arg(failedFreeBrakes_));
+                QMessageBox::warning(this, "失能并松开抱闸",
+                    QString("电机失能已完成，但有 %1 个电机写入抱闸对象 0x2014:01 失败。\n"
+                            "程序已按兼容/未知模式继续，这不会影响无抱闸电机的失能功能。")
+                        .arg(failedFreeBrakes_));
+            } else {
+                lblMotionState_->setText("已失能并松开抱闸");
+                appendLog("机械臂：电机失能及抱闸松开请求均已完成");
+            }
+        }
+    }
+
+    /* 录制准备流程：兼容有/无抱闸电机。尝试松闸，失败时告警但继续录制。 */
     if (r.tag.startsWith("WRECBRK/")) {
         if (!r.ok) ++failedRecordBrakes_;
         if (pendingRecordBrakes_ > 0) --pendingRecordBrakes_;
         if (pendingRecordBrakes_ == 0 && recordPreparing_) {
             recordPreparing_ = false;
             if (failedRecordBrakes_ > 0) {
-                writeAllBrakes(false, "WRECCLOSE");
-                btnRecord_->setEnabled(true);
-                tabs_->setEnabled(true); btnPlay_->setEnabled(true); btnSdoSafe_->setEnabled(running_);
-                lblMotionState_->setText("松开抱闸失败");
+                appendLog(QString("<警告> 有 %1 个电机写入抱闸对象 0x2014:01 失败，按兼容/未知模式继续录制")
+                    .arg(failedRecordBrakes_));
                 QMessageBox::warning(this, "动作录制",
-                    QString("有 %1 个电机松开抱闸失败，已取消录制并重新抱闸。请检查 0x2014 对象和驱动器状态。")
+                    QString("有 %1 个电机写入抱闸对象 0x2014:01 失败。\n"
+                            "程序将按兼容/未知模式继续录制；请确认这些电机没有物理抱闸，"
+                            "或抱闸已经安全松开。")
                         .arg(failedRecordBrakes_));
-            } else if (!worker_->beginMotionRecord(pendingRecordSampleMs_)) {
+            }
+            if (!worker_->beginMotionRecord(pendingRecordSampleMs_)) {
                 writeAllBrakes(false, "WRECCLOSE");
                 btnRecord_->setEnabled(true);
                 tabs_->setEnabled(true); btnPlay_->setEnabled(true); btnSdoSafe_->setEnabled(running_);
-                QMessageBox::warning(this, "动作录制", "松闸成功，但无法开始录制：已有其他动作任务");
+                QMessageBox::warning(this, "动作录制", "无法开始录制：已有其他动作任务");
             } else {
                 recording_ = true;
                 btnRecord_->setText("停止录制并保存"); btnRecord_->setEnabled(true);
-                appendLog(QString("全部电机抱闸已松开，开始动作录制，采样周期 %1 ms")
-                    .arg(pendingRecordSampleMs_));
+                appendLog(QString("抱闸写入尝试完成（失败 %1 个），开始动作录制，采样周期 %2 ms")
+                    .arg(failedRecordBrakes_).arg(pendingRecordSampleMs_));
                 /* 读取实际抱闸状态用于面板回显，不作为写成功后的额外阻塞条件。 */
                 const QVector<MotorStatus> states = worker_->snapshot();
                 for (int i = 0; i < panels_.size(); ++i) {
@@ -1274,28 +1301,30 @@ void MainWindow::onSdoResult(SdoResult r) {
         }
     }
 
-    /* 播放准备流程：播放前也必须先松开所有轴抱闸。 */
+    /* 播放准备流程：兼容有/无抱闸电机。尝试松闸，失败时告警但继续。 */
     if (r.tag.startsWith("WPLAYBRK/")) {
         if (!r.ok) ++failedPlaybackBrakes_;
         if (pendingPlaybackBrakes_ > 0) --pendingPlaybackBrakes_;
         if (pendingPlaybackBrakes_ == 0 && playbackPreparing_) {
             playbackPreparing_ = false;
             if (failedPlaybackBrakes_ > 0) {
-                writeAllBrakes(false, "WPLAYCLOSE");
-                tabs_->setEnabled(true); btnRecord_->setEnabled(true); btnPlay_->setEnabled(true);
-                btnSdoSafe_->setEnabled(running_); lblMotionState_->setText("播放松闸失败");
+                appendLog(QString("<警告> 有 %1 个电机写入抱闸对象 0x2014:01 失败，按兼容/未知模式继续回起点")
+                    .arg(failedPlaybackBrakes_));
                 QMessageBox::warning(this, "动作播放",
-                    QString("有 %1 个电机松开抱闸失败，已取消播放。")
+                    QString("有 %1 个电机写入抱闸对象 0x2014:01 失败。\n"
+                            "程序将按兼容/未知模式继续回起点/播放；请确认这些电机没有物理抱闸，"
+                            "或抱闸已经安全松开。")
                         .arg(failedPlaybackBrakes_));
-            } else if (!worker_->beginMotionReturnToStart(pendingPlaybackMotion_, pendingPlaybackSpeed_)) {
+            }
+            if (!worker_->beginMotionReturnToStart(pendingPlaybackMotion_, pendingPlaybackSpeed_)) {
                 writeAllBrakes(false, "WPLAYCLOSE");
                 tabs_->setEnabled(true); btnRecord_->setEnabled(true); btnPlay_->setEnabled(true);
                 btnSdoSafe_->setEnabled(running_);
-                QMessageBox::warning(this, "回起点", "松闸成功，但回起点任务启动失败");
+                QMessageBox::warning(this, "回起点", "回起点任务启动失败");
             } else {
                 playbackActive_ = true;
-                appendLog(QString("全部电机抱闸已松开，以 %2 脉冲/s 回到动作“%1”的实际起点")
-                    .arg(pendingPlaybackName_).arg(pendingPlaybackSpeed_));
+                appendLog(QString("抱闸写入尝试完成（失败 %1 个），以 %3 脉冲/s 回到动作“%2”的实际起点")
+                    .arg(failedPlaybackBrakes_).arg(pendingPlaybackName_).arg(pendingPlaybackSpeed_));
             }
         }
     }

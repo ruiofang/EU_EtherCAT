@@ -132,6 +132,8 @@ private:
     bool recordPreparing_ = false;
     int pendingRecordBrakes_ = 0;
     int failedRecordBrakes_ = 0;
+    int pendingFreeBrakes_ = 0;
+    int failedFreeBrakes_ = 0;
     int pendingRecordSampleMs_ = 20;
     bool playbackPreparing_ = false;
     int pendingPlaybackBrakes_ = 0;
