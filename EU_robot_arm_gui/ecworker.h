@@ -77,8 +77,8 @@ struct EcConfig {
     uint32_t vendor     = 0x00001097;   // 电机识别用 vendor
     uint32_t product    = 0x00002406;   // 电机识别用 product
     int      cycleUs    = 1000;         // 1ms
-    /* 可选：每个总线位置是否为电机的预设掩码（长度应等于 slaveCount）。
-       留空时 worker 会按实际总线扫描到的 vendor/product 自动判定。 */
+    /* 可选：每个总线位置是否为电机的扫描提示（长度应等于 slaveCount）。
+       worker 启动时仍会按实时 vendor/product 复核，兼容任意位置增减其它设备。 */
     QVector<bool> motorMask;
 };
 
@@ -150,6 +150,8 @@ private:
     ec_domain_t *domain_ = nullptr;
     QVector<ec_slave_config_t*> sc_;
     uint8_t *domain_pd_ = nullptr;
+    bool dcSyncActive_ = false;
+    uint64_t dcCycleNs_ = 0;
 
     /* PDO 偏移 */
     QVector<uint32_t> off_cw_, off_tp_, off_tv_, off_tt_, off_om_, off_r1_;

@@ -11,6 +11,10 @@
 #include <sched.h>
 #include <sys/mman.h>
 
+static constexpr int kStartupAttempts = 3;
+static constexpr int kStartupStallMs = 6000;
+static constexpr int kStartupTimeoutMs = 15000;
+
 /* ============ PDO 描述（与 main.cpp 示例保持一致） ============ */
 static ec_pdo_entry_info_t g_pdo_entries[] = {
     /* RxPDO 0x1600 */
@@ -53,6 +57,21 @@ static const char *xmlForRevision(uint32_t revision) {
     case 143: return "EYOU_ServoModule_ECAT_V143.xml";
     case 145: return "EYOU_ServoModule_ECAT_V145.xml";
     default:  return nullptr;
+    }
+}
+
+static uint64_t monotonicNs() {
+    struct timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void advanceTimespec(struct timespec &ts, uint64_t ns) {
+    ts.tv_sec += (time_t)(ns / 1000000000ULL);
+    ts.tv_nsec += (long)(ns % 1000000000ULL);
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_nsec -= 1000000000L;
+        ++ts.tv_sec;
     }
 }
 
@@ -203,6 +222,8 @@ private:
 /* ================================================================ */
 bool EcWorker::initMaster() {
     opStartupTimedOut_ = false;
+    dcSyncActive_ = false;
+    dcCycleNs_ = 0;
     const int N = cfg_.slaveCount;
     cmds_.clear();   cmds_.resize(N);
     status_.clear(); status_.resize(N);
@@ -237,6 +258,13 @@ bool EcWorker::initMaster() {
     }
 
     const bool useMaskHint = (cfg_.motorMask.size() == N);
+    const uint64_t requestedCycleNs = (uint64_t)qMax(1000, cfg_.cycleUs) * 1000ULL;
+    if (requestedCycleNs > UINT32_MAX) {
+        emit errorOccurred("周期过大，无法配置 EtherCAT DC SYNC0");
+        return false;
+    }
+    dcCycleNs_ = requestedCycleNs;
+    int dcReferenceSlave = -1;
     QString motorList, otherList;
     for (int i = 0; i < N; ++i) {
         MotorStatus &s = status_[i];
@@ -254,12 +282,16 @@ bool EcWorker::initMaster() {
         s.vendorId    = si.vendor_id;
         s.productCode = si.product_code;
         s.revisionNumber = si.revision_number;
+        s.alState = si.al_state;
+        s.online = (si.al_state != 0);
 
-        bool isMotor;
-        if (useMaskHint) {
-            isMotor = cfg_.motorMask[i];
-        } else {
-            isMotor = (si.vendor_id == cfg_.vendor && si.product_code == cfg_.product);
+        /* 扫描掩码只能作为提示：启动前若在首端/中间/末端增减了设备，
+           总线位置可能改变，必须用当前实时身份再次确认，避免误配 PDO。 */
+        const bool isMotor = (si.vendor_id == cfg_.vendor &&
+                              si.product_code == cfg_.product);
+        if (useMaskHint && cfg_.motorMask[i] != isMotor) {
+            emit logMessage(QString("<警告> 从站 #%1 身份与扫描缓存不一致，"
+                                    "已按当前 Vendor/Product 重新分类").arg(i));
         }
         isMotor_[i] = isMotor;
         s.isMotor   = isMotor;
@@ -279,8 +311,8 @@ bool EcWorker::initMaster() {
             }
             emit logMessage(QString("从站 %1: V%2 -> 绑定 xml/%3")
                             .arg(i).arg(si.revision_number).arg(xml));
-            /* 仅为电机从站创建 slave_config 并下发 PDO，非电机从站不做任何配置，
-               IgH 就不会试图把它拉到 OP，从而不会阻塞电机 activate 过程 */
+            /* 仅为电机从站创建 slave_config 并下发 PDO。其它设备无论位于
+               首端、中间还是末端，都只作为透明链路节点保留。 */
             sc_[i] = ecrt_master_slave_config(master_, 0, i, si.vendor_id, si.product_code);
             if (!sc_[i]) {
                 emit errorOccurred(QString("从站 %1 配置失败 (vendor=0x%2 product=0x%3)")
@@ -293,6 +325,14 @@ bool EcWorker::initMaster() {
                 emit errorOccurred(QString("从站 %1 PDO 配置失败").arg(i));
                 return false;
             }
+            /* ESI 的 DC 模式指定 AssignActivate=0x0300。SYNC0 与 PDO 周期一致，
+               使所有伺服在同一分布式时钟边沿采样/更新，避免反复启动时各轴
+               配置状态机落在不同相位。其它设备不参与电机 DC 域。 */
+            if (ecrt_slave_config_dc(sc_[i], 0x0300, (uint32_t)dcCycleNs_, 0, 0, 0)) {
+                emit errorOccurred(QString("从站 %1 DC/SYNC0 配置失败").arg(i));
+                return false;
+            }
+            if (dcReferenceSlave < 0) dcReferenceSlave = i;
             motorList += QString(" #%1").arg(i);
         } else {
             sc_[i] = nullptr;
@@ -314,6 +354,17 @@ bool EcWorker::initMaster() {
         emit errorOccurred("未识别到任何电机从站，请检查 Vendor/Product 是否与总线匹配");
         return false;
     }
+
+    /* 明确选择总线上遇到的第一个电机作为参考时钟。这样参考位置不固定，
+       首端或末端增加其它设备时都不会误选非电机设备。 */
+    if (dcReferenceSlave < 0 ||
+        ecrt_master_select_reference_clock(master_, sc_[dcReferenceSlave]) != 0) {
+        emit errorOccurred("选择 EtherCAT DC 参考时钟失败");
+        return false;
+    }
+    dcSyncActive_ = true;
+    emit logMessage(QString("DC同步已配置：参考电机从站 #%1，SYNC0=%2ns")
+                    .arg(dcReferenceSlave).arg(dcCycleNs_));
 
     /* 仅为电机从站注册 PDO 条目 */
     QVector<ec_pdo_entry_reg_t> regs;
@@ -353,22 +404,33 @@ bool EcWorker::initMaster() {
 
     /* 等待所有电机从站进入 OP（非电机位置未配置，不会被 IgH 尝试带到 OP，不阻塞本流程） */
     emit logMessage("等待电机从站进入 OP ...");
-    /* 启动阶段也按用户配置周期发送 PDO。此前固定 500us 会把 USB 网卡负载
-       翻倍，非实时系统上反而更容易触发从站 SM watchdog。 */
-    const int startupSleepUs = qMax(1000, cfg_.cycleUs);
+    /* EU 官方 DC demo 在进 OP 阶段使用 500us 收发节拍。此阶段尚未执行
+       电机控制，使用较快节拍可让 IgH 配置状态机及时发送邮箱/DC 配置报文。 */
+    const int startupSleepUs = 500;
     const int progressTicks = qMax(1, 100000 / startupSleepUs); // 每 100ms 检查一次
-    const int firstRetryTick = qMax(1, 5000000 / startupSleepUs); // 5s 重试
-    const int maxTicks = qMax(1, 8000000 / startupSleepUs);       // 单次最多 8s
+    const int maxTicks = qMax(1, kStartupTimeoutMs * 1000 / startupSleepUs);
+    emit logMessage(QString("启动配置：收发节拍=%1us，停滞阈值=%2ms，单次超时=%3ms；DC 时钟在进 OP 阶段持续同步")
+                    .arg(startupSleepUs).arg(kStartupStallMs).arg(kStartupTimeoutMs));
+    struct timespec startupWakeup{};
+    clock_gettime(CLOCK_MONOTONIC, &startupWakeup);
     QElapsedTimer startupTimer; startupTimer.start();
+    int bestOpCount = -1;
+    unsigned int bestWorkingCounter = 0;
+    qint64 lastProgressMs = 0;
     for (int tick = 0; tick < maxTicks && running_ && !stopRequested_; ++tick) {
+        if (dcSyncActive_) ecrt_master_application_time(master_, monotonicNs());
         ecrt_master_receive(master_);
         ecrt_domain_process(domain_);
         ecrt_domain_queue(domain_);
-        ecrt_master_send(master_);
-        if (tick == firstRetryTick) {
-            int rc = ecrt_master_reset(master_);
-            emit logMessage(QString("从站未全部 OP，触发 IgH 配置状态机重试 ecrt_master_reset rc=%1").arg(rc));
+        /* DC 从站在 PREOP -> SAFEOP/OP 的配置状态机中会等待时钟偏差收敛。
+           必须在启动阶段就持续校正参考钟和各从站；若等到全部 OP 后才同步，
+           IgH 会对每个从站依次等待约 5 秒的 DC 超时，表现为每 5 秒只进一个轴。
+           分支拓扑同样需要此同步报文，以便补偿各支路的传播延迟。 */
+        if (dcSyncActive_) {
+            ecrt_master_sync_reference_clock(master_);
+            ecrt_master_sync_slave_clocks(master_);
         }
+        ecrt_master_send(master_);
         if (tick % progressTicks == progressTicks - 1 || tick == 0) {
             QString prog;
             int opCnt = 0;
@@ -392,8 +454,20 @@ bool EcWorker::initMaster() {
                 emit logMessage(QString("全部 %1 个电机从站进入 OP").arg(motorCount));
                 return true;
             }
+            if (opCnt > bestOpCount || ds.working_counter > bestWorkingCounter) {
+                bestOpCount = opCnt;
+                bestWorkingCounter = ds.working_counter;
+                lastProgressMs = startupTimer.elapsed();
+            } else if (startupTimer.elapsed() >= kStartupStallMs &&
+                       startupTimer.elapsed() - lastProgressMs >= kStartupStallMs) {
+                emit logMessage(QString("配置进度连续 %1ms 未增长，提前重建 Master")
+                                .arg(kStartupStallMs));
+                break;
+            }
         }
-        usleep(startupSleepUs);
+        /* 绝对定时避免每轮处理耗时累加，保持稳定的 500us 配置报文节拍。 */
+        advanceTimespec(startupWakeup, (uint64_t)startupSleepUs * 1000ULL);
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &startupWakeup, nullptr);
     }
     if (stopRequested_) {
         emit logMessage("启动过程中收到停止请求，取消等待 OP");
@@ -417,7 +491,7 @@ bool EcWorker::initMaster() {
                                         "AL汇总=0x%3 domainWC=%4/%5；%6")
             .arg(startupTimer.elapsed()).arg(ms.slaves_responding)
             .arg(ms.al_states, 1, 16).arg(ds.working_counter).arg((int)ds.wc_state).arg(prog);
-        if (startupAttempt_ >= 2) emit errorOccurred(message);
+        if (startupAttempt_ >= kStartupAttempts) emit errorOccurred(message);
         else emit logMessage("<警告> " + message);
     }
     return false;
@@ -432,6 +506,8 @@ void EcWorker::cleanup() {
     domain_ = nullptr;
     domain_pd_ = nullptr;
     sc_.clear();
+    dcSyncActive_ = false;
+    dcCycleNs_ = 0;
 }
 
 /* ============== SDO 处理（在 SDO 子线程调用；阻塞安全） ============== */
@@ -493,17 +569,18 @@ void EcWorker::run() {
     }
 
     bool masterReady = false;
-    for (startupAttempt_ = 1; startupAttempt_ <= 2 && !stopRequested_; ++startupAttempt_) {
-        emit logMessage(QString("EtherCAT 主站启动尝试 %1/2").arg(startupAttempt_));
+    for (startupAttempt_ = 1; startupAttempt_ <= kStartupAttempts && !stopRequested_; ++startupAttempt_) {
+        emit logMessage(QString("EtherCAT 主站启动尝试 %1/%2")
+                        .arg(startupAttempt_).arg(kStartupAttempts));
         if (initMaster()) {
             masterReady = true;
             break;
         }
-        const bool retryOp = opStartupTimedOut_ && startupAttempt_ < 2 && !stopRequested_;
+        const bool retryOp = opStartupTimedOut_ && startupAttempt_ < kStartupAttempts && !stopRequested_;
         cleanup();
         if (!retryOp) break;
-        emit logMessage("首次进入 OP 超时：完整释放 Master，500ms 后自动重新初始化");
-        usleep(500000);
+        emit logMessage("进入 OP 停滞：完整释放 Master，800ms 后自动重新初始化");
+        usleep(800000);
     }
     if (!masterReady) { cleanup(); running_ = false; emit masterStopped(); return; }
 
@@ -549,6 +626,7 @@ void EcWorker::run() {
         }
         tPrev = tWake; tPrevValid = true;
 
+        if (dcSyncActive_) ecrt_master_application_time(master_, monotonicNs());
         ecrt_master_receive(master_);
         ecrt_domain_process(domain_);
 
@@ -574,18 +652,11 @@ void EcWorker::run() {
 
         QVector<MotorStatus> stLocal(cfg_.slaveCount);
         for (int i = 0; i < cfg_.slaveCount; ++i) {
-            /* 非电机位置：仅刷新 AL/在线信息，不读写 PDO、不运行状态机 */
+            /* 非电机位置：不读写 PDO、不运行状态机。ecrt_master_get_slave()
+               是阻塞接口，严禁放进 1ms RT 循环；这里沿用启动扫描缓存。 */
             if (!isMotor_[i]) {
-                MotorStatus s;
-                s.isMotor     = false;
-                s.vendorId    = status_[i].vendorId;
-                s.productCode = status_[i].productCode;
-                /* 非电机未通过 ecrt_master_slave_config 注册，只能通过 master 查询实时 info */
-                ec_slave_info_t si{};
-                if (ecrt_master_get_slave(master_, (uint16_t)i, &si) == 0) {
-                    s.alState = si.al_state;
-                    s.online  = (si.al_state != 0);
-                }
+                MotorStatus s = status_[i];
+                s.isMotor = false;
                 stLocal[i] = s;
                 continue;
             }
@@ -835,6 +906,10 @@ void EcWorker::run() {
         }
 
         ecrt_domain_queue(domain_);
+        if (dcSyncActive_) {
+            ecrt_master_sync_reference_clock(master_);
+            ecrt_master_sync_slave_clocks(master_);
+        }
         ecrt_master_send(master_);
 
         if (stopping) {

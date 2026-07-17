@@ -1,0 +1,30 @@
+1、安装Qt环境
+#安装 Qt5 基础库
+sudo apt install qtbase5-dev qtbase5-dev-tools
+
+2、安装软件包
+sudo dpkg -i EYouEcTestDemo_1.0.deb
+
+3、运行
+sudo EYouEcTestDemo
+
+若无法打开，可cd /opt/EYouEcTestDemo/bin 进入程序文件夹下  直接运行 sudo ./EYouEcTestDemo
+
+####################
+ps、安装失败
+修复损坏的依赖：
+sudo apt --fix-broken install
+
+修补dpkg状态
+sudo dpkg --configure -a
+
+清理残留依赖
+sudo apt clean
+sudo apt autoclean
+sudo apt autoremove
+
+修正依赖问题
+sudo apt -f install
+
+重新安装软件
+sudo EYouEcTestDemo

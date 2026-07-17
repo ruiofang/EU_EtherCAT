@@ -41,6 +41,9 @@ extern "C" {
 #include <ecrt.h>
 }
 
+static constexpr uint32_t kEuMotorVendor = 0x00001097;
+static constexpr uint32_t kEuMotorProduct = 0x00002406;
+
 static QString alStateText(uint8_t s) {
     switch (s) {
         case 0x01: return "INIT";
@@ -545,15 +548,25 @@ void MainWindow::onScan() {
     ecrt_release_master(m);
 
     if (n > 0) {
-        /* 选定用于电机识别的 vendor/product：若总线全为同一型号则直接采用；
-           否则保留用户原有 vendor/product，只根据匹配情况标记电机位置 */
-        uint32_t motorVendor  = firstVendor;
-        uint32_t motorProduct = firstProduct;
-        if (!allSame) {
-            bool ok1=false, ok2=false;
-            uint32_t v = edVendor_->text().toUInt(&ok1, 0);
-            uint32_t p = edProduct_->text().toUInt(&ok2, 0);
-            if (ok1 && ok2) { motorVendor = v; motorProduct = p; }
+        /* 电机可以出现在任意位置。优先使用当前输入值；若拓扑变化后输入值
+           已不匹配任何从站，则回退查找本项目支持的 EU 电机身份。 */
+        bool ok1=false, ok2=false;
+        uint32_t motorVendor = edVendor_->text().toUInt(&ok1, 0);
+        uint32_t motorProduct = edProduct_->text().toUInt(&ok2, 0);
+        if (!ok1 || !ok2) {
+            motorVendor = kEuMotorVendor;
+            motorProduct = kEuMotorProduct;
+        }
+        auto matchingCount = [&](uint32_t vendor, uint32_t product) {
+            int count = 0;
+            for (const ec_slave_info_t &si : infos)
+                if (si.vendor_id == vendor && si.product_code == product) ++count;
+            return count;
+        };
+        if (matchingCount(motorVendor, motorProduct) == 0 &&
+            matchingCount(kEuMotorVendor, kEuMotorProduct) > 0) {
+            motorVendor = kEuMotorVendor;
+            motorProduct = kEuMotorProduct;
         }
         /* 根据选定 vendor/product 构建电机掩码 */
         motorMask_.fill(false, n);
@@ -568,14 +581,19 @@ void MainWindow::onScan() {
             .arg(motorVendor, 8, 16, QChar('0'))
             .arg(motorProduct, 8, 16, QChar('0')));
 
-        if (allSame) {
-            edVendor_->setText(QString("0x%1").arg(firstVendor, 8, 16, QChar('0')));
-            edProduct_->setText(QString("0x%1").arg(firstProduct, 8, 16, QChar('0')));
-            appendLog(QString("自动填充 Vendor/Product: 0x%1 / 0x%2")
-                .arg(firstVendor, 8, 16, QChar('0'))
-                .arg(firstProduct, 8, 16, QChar('0')));
+        if (motorCnt > 0) {
+            edVendor_->setText(QString("0x%1").arg(motorVendor, 8, 16, QChar('0')));
+            edProduct_->setText(QString("0x%1").arg(motorProduct, 8, 16, QChar('0')));
+            appendLog(QString("电机身份已确认: 0x%1 / 0x%2")
+                .arg(motorVendor, 8, 16, QChar('0'))
+                .arg(motorProduct, 8, 16, QChar('0')));
+            if (!allSame)
+                appendLog("总线存在混合设备；仅控制匹配 Vendor/Product 的电机，"
+                          "首端、中间和末端的其它设备均保持透明兼容。");
+        } else if (allSame) {
+            appendLog("<警告> 当前总线未发现匹配的 EU 电机，从站将全部按其它设备处理。");
         } else {
-            appendLog("总线存在混合设备；仅对匹配当前 Vendor/Product 的位置执行电机控制，其它位置将仅显示 AL 状态。");
+            appendLog("<警告> 混合总线中未发现匹配的 EU 电机，请检查 Vendor/Product。");
         }
 
         /* 如果 setValue 因为值未变化不会发出信号，这里显式刷新一次面板 */
